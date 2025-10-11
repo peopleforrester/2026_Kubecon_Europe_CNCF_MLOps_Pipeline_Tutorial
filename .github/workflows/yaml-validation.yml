@@ -1,0 +1,51 @@
+# ABOUTME: YAML validation workflow for Kubernetes manifests
+# ABOUTME: Validates all YAML files against Kubernetes schemas using kubeconform
+name: YAML Validation
+
+on:
+  push:
+    paths:
+      - '**.yaml'
+      - '**.yml'
+      - 'scripts/validate-yaml.sh'
+  pull_request:
+    paths:
+      - '**.yaml'
+      - '**.yml'
+      - 'scripts/validate-yaml.sh'
+  workflow_dispatch:
+  schedule:
+    # Run weekly on Mondays at 9 AM UTC
+    - cron: '0 9 * * 1'
+
+jobs:
+  validate:
+    name: Validate YAML Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          VERSION="0.6.4"
+          wget -q "https://github.com/yannh/kubeconform/releases/download/v${VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar xzf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+          rm kubeconform-linux-amd64.tar.gz
+          kubeconform -v
+
+      - name: Run YAML validation
+        run: |
+          chmod +x scripts/validate-yaml.sh
+          ./scripts/validate-yaml.sh
+
+      - name: Upload validation results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yaml-validation-results
+          path: |
+            **/*.yaml
+            **/*.yml
+          retention-days: 7

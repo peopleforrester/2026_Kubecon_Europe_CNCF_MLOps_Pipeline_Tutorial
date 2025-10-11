@@ -1,0 +1,267 @@
+# ABOUTME: Helm values for NVIDIA GPU Operator installation
+# ABOUTME: Manages GPU drivers, device plugin, DCGM exporter, and monitoring components
+
+# GPU Operator Helm Chart Configuration
+# Install with: helm install gpu-operator nvidia/gpu-operator -f nvidia-gpu-operator.yaml -n gpu-operator --create-namespace
+
+operator:
+  # GPU Operator image
+  repository: nvcr.io/nvidia/gpu-operator
+  version: v23.9.2
+
+  # Default runtime for GPU containers
+  defaultRuntime: containerd
+
+# Driver configuration
+driver:
+  enabled: true
+  repository: nvcr.io/nvidia
+  image: driver
+  version: "535.129.03"  # CUDA 12.2 compatible
+
+  # Use pre-installed drivers if available
+  usePreinstalled: false
+
+  # Licensing configuration (for vGPU)
+  licensingConfig:
+    configMapName: ""
+    nlsEnabled: false
+
+# NVIDIA Container Toolkit
+toolkit:
+  enabled: true
+  repository: nvcr.io/nvidia/k8s
+  image: container-toolkit
+  version: v1.14.5-ubuntu20.04
+
+# NVIDIA Device Plugin (allocates GPUs to pods)
+devicePlugin:
+  enabled: true
+  repository: nvcr.io/nvidia
+  image: k8s-device-plugin
+  version: v0.14.5
+
+  # Resource configuration
+  config:
+    name: "time-slicing-config"
+    default: "any"
+
+  # Enable time-slicing for GPU sharing (dev/test only)
+  # For production, use HAMi instead
+  resources:
+    - name: nvidia.com/gpu
+      replicas: 1  # Set to >1 for time-slicing (NOT recommended for production)
+
+# DCGM Exporter (GPU metrics for Prometheus)
+dcgmExporter:
+  enabled: true
+  repository: nvcr.io/nvidia/k8s
+  image: dcgm-exporter
+  version: 3.3.5-3.4.1-ubuntu22.04
+
+  # ServiceMonitor for Prometheus Operator
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    honorLabels: false
+    additionalLabels:
+      release: prometheus  # Match your Prometheus Operator release name
+
+  # DCGM metrics configuration
+  config:
+    name: "dcgm-exporter-metrics"
+
+  # GPU metrics to collect
+  arguments:
+    - "-f"
+    - "/etc/dcgm-exporter/dcp-metrics-included.csv"
+    - "-c"
+    - "2000"  # Collect metrics every 2 seconds
+
+# GPU Feature Discovery (labels nodes with GPU properties)
+gfd:
+  enabled: true
+  repository: nvcr.io/nvidia
+  image: gpu-feature-discovery
+  version: v0.8.2
+
+  # Node labels to add
+  # Examples: nvidia.com/gpu.product, nvidia.com/gpu.memory, nvidia.com/cuda.driver.major
+
+# Node Feature Discovery (dependency for GFD)
+nfd:
+  enabled: true
+
+# NVIDIA MIG Manager (for A100/H100 MIG partitioning)
+migManager:
+  enabled: false  # Enable if using MIG
+  repository: nvcr.io/nvidia/cloud-native
+  image: k8s-mig-manager
+  version: v0.7.0
+
+  # MIG strategy: "single" or "mixed"
+  config:
+    name: "mig-parted-config"
+    default: ""
+
+# Validator (optional DaemonSet to validate GPU setup)
+validator:
+  repository: nvcr.io/nvidia/cloud-native
+  image: gpu-operator-validator
+  version: v23.9.2
+
+  # Validator plugin configuration
+  plugin:
+    env:
+      - name: WITH_WORKLOAD
+        value: "true"
+
+# Node selector for GPU Operator components
+# Deploy only on GPU nodes
+daemonsets:
+  priorityClassName: system-node-critical
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+  # Node affinity
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.present
+                operator: In
+                values:
+                  - "true"
+
+# Toolkit container runtime configuration
+toolkit:
+  env:
+    # Set default runtime to containerd
+    - name: CONTAINERD_CONFIG
+      value: /etc/containerd/config.toml
+    - name: CONTAINERD_SOCKET
+      value: /run/containerd/containerd.sock
+    - name: CONTAINERD_RUNTIME_CLASS
+      value: nvidia
+    - name: CONTAINERD_SET_AS_DEFAULT
+      value: "true"
+
+---
+# Time-Slicing ConfigMap (Development/Test Only)
+# For production GPU sharing, use HAMi instead
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator
+data:
+  any: |-
+    version: v1
+    sharing:
+      timeSlicing:
+        replicas: 1  # Change to >1 for time-slicing (causes 5-10x latency!)
+
+---
+# DCGM Metrics ConfigMap
+# Defines which GPU metrics to export to Prometheus
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dcgm-exporter-metrics
+  namespace: gpu-operator
+data:
+  dcp-metrics-included.csv: |
+    # GPU Utilization
+    DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization (%).
+
+    # GPU Memory
+    DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization (%).
+    DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (MiB).
+    DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (MiB).
+
+    # GPU Temperature
+    DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (C).
+    DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature (C).
+
+    # GPU Power
+    DCGM_FI_DEV_POWER_USAGE, gauge, Power usage (W).
+    DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption (mJ).
+
+    # GPU Clock Speeds
+    DCGM_FI_DEV_SM_CLOCK, gauge, SM clock frequency (MHz).
+    DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock frequency (MHz).
+
+    # GPU Compute
+    DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, gauge, Tensor Core utilization (%).
+    DCGM_FI_PROF_PIPE_FP64_ACTIVE, gauge, FP64 utilization (%).
+    DCGM_FI_PROF_PIPE_FP32_ACTIVE, gauge, FP32 utilization (%).
+    DCGM_FI_PROF_PIPE_FP16_ACTIVE, gauge, FP16 utilization (%).
+
+    # GPU Errors (for reliability monitoring)
+    DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Total double bit ECC errors.
+    DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Total single bit ECC errors.
+
+    # NVLink (for multi-GPU training)
+    DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL, counter, Total NVLink bandwidth (bytes).
+
+---
+# MIG Partitioning Config (for A100/H100)
+# Example: Partition A100 80GB into 7x 1g.10gb instances
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mig-parted-config
+  namespace: gpu-operator
+data:
+  config.yaml: |
+    version: v1
+    mig-configs:
+      # Partition entire GPU into 7x 1g.10gb instances (inference)
+      all-1g.10gb:
+        - devices: [0]
+          mig-enabled: true
+          mig-devices:
+            "1g.10gb": 7
+
+      # Partition into 3x 3g.40gb instances (training)
+      all-3g.40gb:
+        - devices: [0]
+          mig-enabled: true
+          mig-devices:
+            "3g.40gb": 2
+
+      # Mixed: 1x 3g.40gb + 4x 1g.10gb
+      mixed-profile:
+        - devices: [0]
+          mig-enabled: true
+          mig-devices:
+            "3g.40gb": 1
+            "1g.10gb": 4
+
+      # Disable MIG (full GPU access)
+      all-disabled:
+        - devices: all
+          mig-enabled: false
+
+---
+# ServiceMonitor for Prometheus Operator
+# Automatically scrapes DCGM Exporter metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dcgm-exporter
+  namespace: gpu-operator
+  labels:
+    app: dcgm-exporter
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+      scheme: http

@@ -1,0 +1,550 @@
+# ABOUTME: Cost allocation models and policies for ML platform with team budgets and chargeback
+# ABOUTME: Includes ResourceQuotas, LimitRanges, and budget enforcement for multi-tenant cost control
+
+---
+# Cost Allocation Overview
+#
+# Three allocation models:
+#
+# 1. Namespace-based (simplest)
+#    - Each team gets dedicated namespace
+#    - All costs in namespace charged to team
+#    - Easy to implement, less flexible
+#
+# 2. Label-based (recommended)
+#    - Costs tracked by labels (team, project, model)
+#    - Flexible, accurate, supports shared namespaces
+#    - Requires label discipline
+#
+# 3. Shared cost allocation
+#    - Platform services (monitoring, storage)
+#    - Split evenly or by usage percentage
+#    - Fair distribution of overhead
+#
+# Budget enforcement:
+# - Soft limits: Alert at 80%, 90%
+# - Hard limits: Block new resources at 100%
+# - Monthly review and reallocation
+
+---
+# Team Budget Definitions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: team-budgets
+  namespace: opencost
+data:
+  budgets.yaml: |
+    # Monthly budgets per team (USD)
+    budgets:
+      ml-team:
+        monthly_budget: 10000
+        alert_thresholds:
+          - level: warning
+            percentage: 80
+            notify: slack
+          - level: critical
+            percentage: 90
+            notify: pagerduty
+        hard_limit: true  # Block resources at 100%
+
+      data-science:
+        monthly_budget: 8000
+        alert_thresholds:
+          - level: warning
+            percentage: 80
+            notify: slack
+          - level: critical
+            percentage: 90
+            notify: slack
+        hard_limit: false  # Allow overage with approval
+
+      research:
+        monthly_budget: 15000
+        alert_thresholds:
+          - level: warning
+            percentage: 85
+            notify: email
+        hard_limit: false
+
+      platform:
+        monthly_budget: 5000  # Shared services
+        alert_thresholds:
+          - level: warning
+            percentage: 90
+            notify: slack
+        hard_limit: true
+
+---
+# ML Team Namespace with ResourceQuota
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-team
+  labels:
+    team: ml-team
+    cost-center: CC-2024-ML-001
+
+---
+# ResourceQuota for ML Team (budget enforcement)
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-team-budget-quota
+  namespace: ml-team
+spec:
+  hard:
+    # Compute limits (translate from $ to resources)
+    # $10,000/month = ~326 GPU hours/month @ $3.06/hour
+    # = ~10.8 GPU hours/day = ~11 GPUs for 1 hour/day
+    requests.cpu: "200"           # 200 CPU cores
+    requests.memory: 800Gi        # 800 GB RAM
+    requests.nvidia.com/gpu: "20" # 20 GPUs max
+
+    limits.cpu: "400"
+    limits.memory: 1600Gi
+    limits.nvidia.com/gpu: "20"
+
+    # Storage limits
+    requests.storage: 50Ti        # 50 TB total storage
+    persistentvolumeclaims: "100" # Max 100 PVCs
+
+    # Pod limits
+    pods: "500"                   # Max 500 pods
+    services: "100"               # Max 100 services
+
+---
+# LimitRange for ML Team (cost control per pod)
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: ml-team-limits
+  namespace: ml-team
+spec:
+  limits:
+    # Pod limits
+    - type: Pod
+      max:
+        cpu: "32"
+        memory: 128Gi
+        nvidia.com/gpu: "8"
+      min:
+        cpu: "100m"
+        memory: 128Mi
+
+    # Container limits
+    - type: Container
+      max:
+        cpu: "16"
+        memory: 64Gi
+        nvidia.com/gpu: "4"
+      min:
+        cpu: "100m"
+        memory: 128Mi
+      default:
+        cpu: "1"
+        memory: 4Gi
+      defaultRequest:
+        cpu: "500m"
+        memory: 2Gi
+
+    # PVC limits
+    - type: PersistentVolumeClaim
+      max:
+        storage: 10Ti
+      min:
+        storage: 1Gi
+
+---
+# Data Science Team Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data-science
+  labels:
+    team: data-science
+    cost-center: CC-2024-DS-001
+
+---
+# ResourceQuota for Data Science Team
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: data-science-budget-quota
+  namespace: data-science
+spec:
+  hard:
+    # $8,000/month = ~261 GPU hours/month
+    requests.cpu: "160"
+    requests.memory: 640Gi
+    requests.nvidia.com/gpu: "16"
+
+    limits.cpu: "320"
+    limits.memory: 1280Gi
+    limits.nvidia.com/gpu: "16"
+
+    requests.storage: 40Ti
+    persistentvolumeclaims: "80"
+    pods: "400"
+
+---
+# Cost allocation by project
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: project-allocation
+  namespace: opencost
+data:
+  projects.yaml: |
+    # Project-based cost allocation within teams
+    projects:
+      fraud-detection:
+        team: ml-team
+        budget: 3000  # $3K of team's $10K budget
+        priority: high
+
+      recommendation-engine:
+        team: ml-team
+        budget: 4000
+        priority: high
+
+      customer-churn:
+        team: data-science
+        budget: 3500
+        priority: medium
+
+      research-experiments:
+        team: research
+        budget: 15000
+        priority: low
+
+---
+# Shared cost allocation
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shared-cost-allocation
+  namespace: opencost
+data:
+  shared-costs.yaml: |
+    # Shared infrastructure costs
+    # Allocate based on usage percentage
+
+    shared_services:
+      # Monitoring stack (Prometheus, Grafana)
+      monitoring:
+        monthly_cost: 500
+        allocation_method: equal  # Split equally
+
+      # Storage (Harbor registry, shared datasets)
+      storage:
+        monthly_cost: 2000
+        allocation_method: proportional  # By usage
+
+      # Networking (ingress, load balancers)
+      networking:
+        monthly_cost: 300
+        allocation_method: proportional
+
+      # Control plane
+      kubernetes:
+        monthly_cost: 1000
+        allocation_method: equal
+
+      # Data pipeline (Kafka, Argo)
+      data_pipeline:
+        monthly_cost: 800
+        allocation_method: proportional
+
+    # Total shared cost: $4,600/month
+    # Split across 4 teams = $1,150/team base cost
+
+---
+# Cost allocation report generator
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cost-allocation-report
+  namespace: opencost
+spec:
+  schedule: "0 0 * * *"  # Daily at midnight
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: opencost
+          containers:
+            - name: report-generator
+              image: curlimages/curl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  #!/bin/sh
+                  # Generate daily cost allocation report
+
+                  OPENCOST_API="http://opencost.opencost:9003"
+                  DATE=$(date +%Y-%m-%d)
+
+                  echo "=== Cost Allocation Report - $DATE ==="
+
+                  # 1. Cost by team
+                  echo ""
+                  echo "Cost by Team:"
+                  curl -s "$OPENCOST_API/allocation/compute?window=1d&aggregate=label:team" | \
+                    jq -r '.data[] | "\(.name): $\(.totalCost | tonumber | floor)"'
+
+                  # 2. Cost by project
+                  echo ""
+                  echo "Cost by Project:"
+                  curl -s "$OPENCOST_API/allocation/compute?window=1d&aggregate=label:project" | \
+                    jq -r '.data[] | "\(.name): $\(.totalCost | tonumber | floor)"'
+
+                  # 3. Cost by model
+                  echo ""
+                  echo "Cost by Model:"
+                  curl -s "$OPENCOST_API/allocation/compute?window=1d&aggregate=label:ml.model-name" | \
+                    jq -r '.data[] | "\(.name): $\(.totalCost | tonumber | floor)"'
+
+                  # 4. GPU cost breakdown
+                  echo ""
+                  echo "GPU Cost:"
+                  curl -s "$OPENCOST_API/allocation/compute?window=1d&aggregate=label:team" | \
+                    jq -r '.data[] | "\(.name): $\(.gpuCost | tonumber | floor) (\(.gpuCost / .totalCost * 100 | floor)% of total)"'
+
+                  # 5. Idle cost (waste)
+                  echo ""
+                  echo "Idle Cost (Waste):"
+                  curl -s "$OPENCOST_API/allocation/compute?window=1d&idle=true" | \
+                    jq -r '.data[] | "\(.name): $\(.idleCost | tonumber | floor) (efficiency: \(.efficiency | tonumber * 100 | floor)%)"'
+
+                  # Save to file (would send to Slack/email in production)
+                  # curl -X POST https://hooks.slack.com/services/YOUR/WEBHOOK \
+                  #   -H 'Content-Type: application/json' \
+                  #   -d "{\"text\": \"Daily cost report: ...\"}"
+
+          restartPolicy: OnFailure
+
+---
+# Budget monitoring CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: budget-monitor
+  namespace: opencost
+spec:
+  schedule: "0 */4 * * *"  # Every 4 hours
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: opencost
+          containers:
+            - name: budget-monitor
+              image: curlimages/curl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  #!/bin/sh
+                  # Monitor team budgets and send alerts
+
+                  OPENCOST_API="http://opencost.opencost:9003"
+
+                  # Get monthly cost by team
+                  MONTHLY_COSTS=$(curl -s "$OPENCOST_API/allocation/compute?window=30d&aggregate=label:team")
+
+                  echo "=== Budget Monitoring ==="
+
+                  # Check ML Team budget ($10,000/month)
+                  ML_COST=$(echo "$MONTHLY_COSTS" | jq -r '.data[] | select(.name == "ml-team") | .totalCost')
+                  ML_BUDGET=10000
+                  ML_PERCENT=$(echo "scale=0; $ML_COST / $ML_BUDGET * 100" | bc)
+
+                  echo "ML Team: \$$ML_COST / \$$ML_BUDGET ($ML_PERCENT%)"
+
+                  if [ "$ML_PERCENT" -gt 90 ]; then
+                    echo "CRITICAL: ML Team at $ML_PERCENT% of budget!"
+                    # Send PagerDuty alert
+                  elif [ "$ML_PERCENT" -gt 80 ]; then
+                    echo "WARNING: ML Team at $ML_PERCENT% of budget"
+                    # Send Slack alert
+                  fi
+
+                  # Repeat for other teams...
+
+          restartPolicy: OnFailure
+
+---
+# Cost forecasting
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cost-forecasting
+  namespace: opencost
+data:
+  forecast.py: |
+    #!/usr/bin/env python3
+    # Cost forecasting based on historical trends
+
+    import requests
+    import json
+    from datetime import datetime, timedelta
+
+    OPENCOST_API = "http://opencost.opencost:9003"
+
+    def get_daily_costs(days=30):
+        """Get daily costs for last N days"""
+        url = f"{OPENCOST_API}/allocation/compute?window={days}d&step=1d&aggregate=label:team"
+        response = requests.get(url)
+        return response.json()
+
+    def forecast_monthly_cost(team, daily_costs):
+        """Forecast end-of-month cost based on current trend"""
+        # Simple linear extrapolation
+        days_elapsed = datetime.now().day
+        days_in_month = 30  # Approximate
+
+        total_cost = sum(day['totalCost'] for day in daily_costs if day['name'] == team)
+        avg_daily_cost = total_cost / days_elapsed
+
+        forecast = avg_daily_cost * days_in_month
+        return forecast
+
+    def main():
+        print("=== Cost Forecasting ===")
+
+        # Get historical data
+        data = get_daily_costs(30)
+
+        teams = ["ml-team", "data-science", "research"]
+        budgets = {"ml-team": 10000, "data-science": 8000, "research": 15000}
+
+        for team in teams:
+            forecast = forecast_monthly_cost(team, data['data'])
+            budget = budgets[team]
+            percentage = (forecast / budget) * 100
+
+            print(f"\n{team}:")
+            print(f"  Forecast: ${forecast:.2f}")
+            print(f"  Budget: ${budget:.2f}")
+            print(f"  Projected: {percentage:.1f}%")
+
+            if percentage > 100:
+                print(f"  ⚠️  ALERT: Projected to exceed budget by ${forecast - budget:.2f}")
+            elif percentage > 90:
+                print(f"  ⚠️  WARNING: Approaching budget limit")
+
+    if __name__ == "__main__":
+        main()
+
+---
+# Chargeback report generator
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chargeback-reports
+  namespace: opencost
+data:
+  generate-invoice.sh: |
+    #!/bin/bash
+    # Generate monthly chargeback invoices
+
+    OPENCOST_API="http://opencost.opencost:9003"
+    MONTH=$(date -d "last month" +%Y-%m)
+
+    echo "=== Monthly Chargeback Report - $MONTH ==="
+
+    # Get all teams
+    TEAMS=("ml-team" "data-science" "research")
+
+    for TEAM in "${TEAMS[@]}"; do
+      echo ""
+      echo "===================="
+      echo "Team: $TEAM"
+      echo "===================="
+
+      # Get team's monthly cost
+      COST_DATA=$(curl -s "$OPENCOST_API/allocation/compute?window=30d&aggregate=label:team&filter=label:team:$TEAM")
+
+      # Parse costs
+      CPU_COST=$(echo "$COST_DATA" | jq -r '.data[0].cpuCost')
+      RAM_COST=$(echo "$COST_DATA" | jq -r '.data[0].ramCost')
+      GPU_COST=$(echo "$COST_DATA" | jq -r '.data[0].gpuCost')
+      STORAGE_COST=$(echo "$COST_DATA" | jq -r '.data[0].pvCost')
+      NETWORK_COST=$(echo "$COST_DATA" | jq -r '.data[0].networkCost')
+      TOTAL_COST=$(echo "$COST_DATA" | jq -r '.data[0].totalCost')
+
+      # Add shared costs (from ConfigMap)
+      SHARED_COST=1150  # $1,150/team base cost
+      GRAND_TOTAL=$(echo "$TOTAL_COST + $SHARED_COST" | bc)
+
+      # Print invoice
+      echo "Direct Costs:"
+      echo "  CPU:     \$$(printf '%.2f' $CPU_COST)"
+      echo "  RAM:     \$$(printf '%.2f' $RAM_COST)"
+      echo "  GPU:     \$$(printf '%.2f' $GPU_COST)"
+      echo "  Storage: \$$(printf '%.2f' $STORAGE_COST)"
+      echo "  Network: \$$(printf '%.2f' $NETWORK_COST)"
+      echo "  Subtotal: \$$(printf '%.2f' $TOTAL_COST)"
+      echo ""
+      echo "Shared Costs:"
+      echo "  Platform: \$$SHARED_COST"
+      echo ""
+      echo "TOTAL: \$$(printf '%.2f' $GRAND_TOTAL)"
+
+      # Export to CSV
+      echo "$TEAM,$MONTH,$CPU_COST,$RAM_COST,$GPU_COST,$STORAGE_COST,$NETWORK_COST,$SHARED_COST,$GRAND_TOTAL" >> invoices-$MONTH.csv
+    done
+
+    echo ""
+    echo "Invoices saved to: invoices-$MONTH.csv"
+
+---
+# Best Practices Summary:
+#
+# 1. Label Discipline:
+#    - Require team, project, environment labels on ALL resources
+#    - Use admission webhook to enforce labels (see security phase)
+#    - Validate labels in CI/CD pipelines
+#
+# 2. Budget Allocation:
+#    - Set realistic budgets based on historical data
+#    - Review and adjust quarterly
+#    - Reserve 10-20% buffer for spikes
+#
+# 3. Cost Optimization:
+#    - Daily cost reports to teams
+#    - Weekly waste identification (idle resources)
+#    - Monthly chargeback to drive accountability
+#
+# 4. ResourceQuotas:
+#    - Set quotas to prevent runaway costs
+#    - Leave 20% headroom for legitimate spikes
+#    - Monitor quota usage weekly
+#
+# 5. Forecasting:
+#    - Forecast monthly costs by day 10
+#    - Take corrective action if > 90% projected
+#    - Options: scale down dev, defer experiments
+#
+# 6. Chargeback Timing:
+#    - Generate invoices on 1st of month
+#    - Share with finance by 5th
+#    - Teams review and dispute by 15th
+#    - Final invoices by 20th
+#
+# Example cost breakdown for ML Team ($10,000/month):
+# - GPU: $7,000 (70%) - 2,285 GPU hours @ $3.06/hour
+# - CPU: $1,500 (15%) - 47,380 CPU hours @ $0.032/hour
+# - Storage: $1,000 (10%) - 2.5 PB @ $0.00014/GB/hour
+# - Network: $500 (5%) - 4 TB egress @ $0.12/GB
+# - Shared: $1,150 (platform overhead)
+# Total: $11,150
+#
+# Cost savings opportunities:
+# - Spot GPUs: Save 60% ($2,800/month)
+# - Right-sizing: Save 20% ($2,000/month)
+# - Archive old data: Save 50% storage ($500/month)
+# - Off-hours shutdown: Save 30% dev costs ($300/month)
+# Total potential savings: $5,600/month (50%)

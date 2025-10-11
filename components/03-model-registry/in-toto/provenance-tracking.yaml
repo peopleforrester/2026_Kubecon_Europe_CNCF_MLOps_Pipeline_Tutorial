@@ -1,0 +1,651 @@
+# ABOUTME: Model lineage and provenance tracking for complete ML pipeline audit trails
+# ABOUTME: Tracks data sources, training configs, hyperparameters, and artifacts for reproducibility
+
+---
+# Provenance Tracking Overview
+#
+# ML model provenance answers:
+# 1. What data was used for training? (dataset name, version, SHA256)
+# 2. What code was used? (git commit, repository, branch)
+# 3. What hyperparameters? (learning rate, batch size, epochs)
+# 4. What infrastructure? (GPU type, PyTorch version, CUDA version)
+# 5. Who trained it? (user, timestamp, organization)
+# 6. What was the result? (accuracy, loss, F1 score)
+#
+# Why this matters:
+# - Reproducibility: Re-create exact model from provenance
+# - Debugging: Trace accuracy regression to specific data change
+# - Compliance: Prove model training meets regulations (GDPR, CCPA)
+# - Audit: Answer "why did model make this prediction?"
+#
+# Standards:
+# - SLSA (Supply-chain Levels for Software Artifacts)
+# - in-toto (supply chain security)
+# - ML-BOM (Machine Learning Bill of Materials)
+
+---
+# Provenance Schema: Complete training metadata
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: provenance-schema
+  namespace: ml-models
+data:
+  schema.json: |
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ML Model Provenance",
+      "type": "object",
+      "required": ["model", "training", "data", "code", "infrastructure", "results"],
+      "properties": {
+        "model": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string"},
+            "version": {"type": "string"},
+            "framework": {"type": "string"},
+            "architecture": {"type": "string"},
+            "task": {"type": "string"},
+            "sha256": {"type": "string"}
+          }
+        },
+        "training": {
+          "type": "object",
+          "properties": {
+            "start_time": {"type": "string", "format": "date-time"},
+            "end_time": {"type": "string", "format": "date-time"},
+            "duration_seconds": {"type": "number"},
+            "hyperparameters": {
+              "type": "object",
+              "properties": {
+                "learning_rate": {"type": "number"},
+                "batch_size": {"type": "integer"},
+                "epochs": {"type": "integer"},
+                "optimizer": {"type": "string"}
+              }
+            },
+            "trainer": {"type": "string"},
+            "organization": {"type": "string"}
+          }
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "training_dataset": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "version": {"type": "string"},
+                "uri": {"type": "string"},
+                "sha256": {"type": "string"},
+                "size_bytes": {"type": "integer"},
+                "num_samples": {"type": "integer"}
+              }
+            },
+            "validation_dataset": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "version": {"type": "string"},
+                "uri": {"type": "string"},
+                "sha256": {"type": "string"}
+              }
+            }
+          }
+        },
+        "code": {
+          "type": "object",
+          "properties": {
+            "repository": {"type": "string"},
+            "commit": {"type": "string"},
+            "branch": {"type": "string"},
+            "tag": {"type": "string"},
+            "training_script": {"type": "string"}
+          }
+        },
+        "infrastructure": {
+          "type": "object",
+          "properties": {
+            "gpu_type": {"type": "string"},
+            "num_gpus": {"type": "integer"},
+            "pytorch_version": {"type": "string"},
+            "cuda_version": {"type": "string"},
+            "python_version": {"type": "string"},
+            "os": {"type": "string"}
+          }
+        },
+        "results": {
+          "type": "object",
+          "properties": {
+            "metrics": {
+              "type": "object",
+              "properties": {
+                "accuracy": {"type": "number"},
+                "loss": {"type": "number"},
+                "f1_score": {"type": "number"}
+              }
+            },
+            "artifacts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "uri": {"type": "string"},
+                  "sha256": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+---
+# Example: Capture provenance during training
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-with-provenance
+  namespace: ml-training
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q gitpython
+
+              cat > train_with_provenance.py << 'EOF'
+              import torch
+              import json
+              import hashlib
+              import os
+              from datetime import datetime
+              import git
+
+              # Training configuration
+              LEARNING_RATE = 0.001
+              BATCH_SIZE = 32
+              EPOCHS = 10
+
+              # Capture provenance
+              provenance = {
+                  "model": {
+                      "name": "llama2-7b",
+                      "version": "1.0.0",
+                      "framework": "pytorch",
+                      "architecture": "llama2",
+                      "task": "text-generation"
+                  },
+                  "training": {
+                      "start_time": datetime.utcnow().isoformat() + "Z",
+                      "hyperparameters": {
+                          "learning_rate": LEARNING_RATE,
+                          "batch_size": BATCH_SIZE,
+                          "epochs": EPOCHS,
+                          "optimizer": "adam"
+                      },
+                      "trainer": os.environ.get("USER", "unknown"),
+                      "organization": "example-ml-team"
+                  },
+                  "data": {
+                      "training_dataset": {
+                          "name": "openwebtext",
+                          "version": "1.0",
+                          "uri": "s3://datasets/openwebtext-v1.parquet",
+                          "sha256": "abc123...",  # Compute actual hash
+                          "num_samples": 1000000
+                      }
+                  },
+                  "code": {
+                      "repository": "https://github.com/my-org/ml-models",
+                      "commit": "abc1234567",  # Get from git
+                      "branch": "main",
+                      "training_script": "train.py"
+                  },
+                  "infrastructure": {
+                      "gpu_type": os.environ.get("GPU_TYPE", "A100"),
+                      "num_gpus": torch.cuda.device_count(),
+                      "pytorch_version": torch.__version__,
+                      "cuda_version": torch.version.cuda,
+                      "python_version": "3.11",
+                      "os": "Ubuntu 22.04"
+                  }
+              }
+
+              # Simulate training
+              model = torch.nn.Linear(100, 10)
+              print(f"Training with learning_rate={LEARNING_RATE}, batch_size={BATCH_SIZE}, epochs={EPOCHS}")
+
+              # Simulate metrics
+              final_accuracy = 0.92
+              final_loss = 0.15
+
+              # Save model
+              model_path = "model/weights.pth"
+              os.makedirs("model", exist_ok=True)
+              torch.save(model.state_dict(), model_path)
+
+              # Compute model SHA256
+              with open(model_path, "rb") as f:
+                  model_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+              provenance["model"]["sha256"] = model_sha256
+
+              # Capture results
+              provenance["training"]["end_time"] = datetime.utcnow().isoformat() + "Z"
+              provenance["training"]["duration_seconds"] = 3600  # 1 hour
+
+              provenance["results"] = {
+                  "metrics": {
+                      "accuracy": final_accuracy,
+                      "loss": final_loss,
+                      "f1_score": 0.91
+                  },
+                  "artifacts": [
+                      {
+                          "name": "model_weights",
+                          "uri": f"harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0",
+                          "sha256": model_sha256
+                      }
+                  ]
+              }
+
+              # Save provenance
+              with open("provenance.json", "w") as f:
+                  json.dump(provenance, f, indent=2)
+
+              print("✓ Training complete")
+              print(f"  - Accuracy: {final_accuracy}")
+              print(f"  - Model SHA256: {model_sha256}")
+              print(f"  - Provenance saved to provenance.json")
+
+              # Upload provenance to S3
+              # aws s3 cp provenance.json s3://ml-provenance/llama2-7b/1.0.0/provenance.json
+              EOF
+
+              python train_with_provenance.py
+
+              # Display provenance
+              echo "=== Provenance ==="
+              cat provenance.json
+
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+
+---
+# Store provenance in ConfigMap (for demo)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llama2-7b-provenance
+  namespace: ml-models
+  labels:
+    model.name: llama2-7b
+    model.version: "1.0.0"
+data:
+  provenance.json: |
+    {
+      "model": {
+        "name": "llama2-7b",
+        "version": "1.0.0",
+        "framework": "pytorch",
+        "architecture": "llama2",
+        "task": "text-generation",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "training": {
+        "start_time": "2024-01-15T10:00:00Z",
+        "end_time": "2024-01-15T14:30:00Z",
+        "duration_seconds": 16200,
+        "hyperparameters": {
+          "learning_rate": 0.001,
+          "batch_size": 32,
+          "epochs": 10,
+          "optimizer": "adam",
+          "weight_decay": 0.01,
+          "gradient_accumulation_steps": 4
+        },
+        "trainer": "alice@example.com",
+        "organization": "example-ml-team"
+      },
+      "data": {
+        "training_dataset": {
+          "name": "openwebtext",
+          "version": "1.0",
+          "uri": "s3://datasets/openwebtext-v1.parquet",
+          "sha256": "abc123def456...",
+          "size_bytes": 54000000000,
+          "num_samples": 8013769
+        },
+        "validation_dataset": {
+          "name": "openwebtext-val",
+          "version": "1.0",
+          "uri": "s3://datasets/openwebtext-val-v1.parquet",
+          "sha256": "def456ghi789...",
+          "num_samples": 100000
+        }
+      },
+      "code": {
+        "repository": "https://github.com/my-org/ml-models",
+        "commit": "abc1234567890def",
+        "branch": "main",
+        "tag": "v1.0.0",
+        "training_script": "train_llama2.py"
+      },
+      "infrastructure": {
+        "gpu_type": "NVIDIA A100 80GB",
+        "num_gpus": 8,
+        "pytorch_version": "2.1.0",
+        "cuda_version": "12.1",
+        "python_version": "3.11.5",
+        "os": "Ubuntu 22.04",
+        "kubernetes_version": "1.28.0",
+        "node_type": "p4d.24xlarge"
+      },
+      "results": {
+        "metrics": {
+          "accuracy": 0.92,
+          "loss": 0.15,
+          "f1_score": 0.91,
+          "perplexity": 12.3
+        },
+        "artifacts": [
+          {
+            "name": "model_weights",
+            "uri": "harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          },
+          {
+            "name": "training_logs",
+            "uri": "s3://ml-artifacts/llama2-7b/1.0.0/logs.txt",
+            "sha256": "ghi789jkl012..."
+          },
+          {
+            "name": "tensorboard",
+            "uri": "s3://ml-artifacts/llama2-7b/1.0.0/tensorboard/",
+            "sha256": "jkl012mno345..."
+          }
+        ]
+      }
+    }
+
+---
+# Query provenance API
+apiVersion: v1
+kind: Service
+metadata:
+  name: provenance-api
+  namespace: ml-models
+spec:
+  selector:
+    app: provenance-api
+  ports:
+    - port: 8080
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provenance-api
+  namespace: ml-models
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: provenance-api
+  template:
+    metadata:
+      labels:
+        app: provenance-api
+    spec:
+      containers:
+        - name: api
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q flask kubernetes
+
+              cat > api.py << 'EOF'
+              from flask import Flask, jsonify, request
+              from kubernetes import client, config
+              import json
+
+              app = Flask(__name__)
+              config.load_incluster_config()
+              v1 = client.CoreV1Api()
+
+              @app.route('/provenance/<model_name>/<version>')
+              def get_provenance(model_name, version):
+                  """Get provenance for specific model version"""
+                  cm_name = f"{model_name}-provenance"
+                  try:
+                      cm = v1.read_namespaced_config_map(cm_name, "ml-models")
+                      provenance = json.loads(cm.data["provenance.json"])
+                      return jsonify(provenance)
+                  except:
+                      return jsonify({"error": "Provenance not found"}), 404
+
+              @app.route('/provenance/search')
+              def search_provenance():
+                  """Search provenance by criteria"""
+                  # Example: /provenance/search?trainer=alice@example.com&min_accuracy=0.90
+                  trainer = request.args.get('trainer')
+                  min_accuracy = float(request.args.get('min_accuracy', 0))
+
+                  cms = v1.list_namespaced_config_map("ml-models", label_selector="model.name")
+                  results = []
+
+                  for cm in cms.items:
+                      if "provenance.json" in cm.data:
+                          provenance = json.loads(cm.data["provenance.json"])
+
+                          # Filter by trainer
+                          if trainer and provenance["training"]["trainer"] != trainer:
+                              continue
+
+                          # Filter by accuracy
+                          if provenance["results"]["metrics"]["accuracy"] < min_accuracy:
+                              continue
+
+                          results.append(provenance)
+
+                  return jsonify(results)
+
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              EOF
+
+              python api.py
+
+          ports:
+            - containerPort: 8080
+
+---
+# Query examples
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: provenance-query-examples
+  namespace: ml-models
+data:
+  query.sh: |
+    #!/bin/bash
+    # Query provenance API
+
+    API_URL="http://provenance-api:8080"
+
+    # Get provenance for specific model
+    curl "$API_URL/provenance/llama2-7b/1.0.0" | jq .
+
+    # Search models by trainer
+    curl "$API_URL/provenance/search?trainer=alice@example.com" | jq .
+
+    # Search models with accuracy > 90%
+    curl "$API_URL/provenance/search?min_accuracy=0.90" | jq .
+
+    # Get training hyperparameters
+    curl "$API_URL/provenance/llama2-7b/1.0.0" | jq '.training.hyperparameters'
+
+    # Get dataset used for training
+    curl "$API_URL/provenance/llama2-7b/1.0.0" | jq '.data.training_dataset'
+
+    # Get git commit
+    curl "$API_URL/provenance/llama2-7b/1.0.0" | jq '.code.commit'
+
+---
+# Lineage Tracking: Parent-child relationships
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-lineage
+  namespace: ml-models
+data:
+  lineage.json: |
+    {
+      "models": [
+        {
+          "name": "llama2-7b-base",
+          "version": "1.0.0",
+          "children": [
+            {
+              "name": "llama2-7b-chat",
+              "version": "1.0.0",
+              "relationship": "fine-tuned",
+              "dataset": "openassistant-conversations",
+              "date": "2024-01-20"
+            },
+            {
+              "name": "llama2-7b-code",
+              "version": "1.0.0",
+              "relationship": "fine-tuned",
+              "dataset": "code-alpaca",
+              "date": "2024-01-22"
+            }
+          ]
+        },
+        {
+          "name": "llama2-7b-chat",
+          "version": "1.0.0",
+          "parent": {
+            "name": "llama2-7b-base",
+            "version": "1.0.0"
+          },
+          "children": [
+            {
+              "name": "llama2-7b-chat-rlhf",
+              "version": "1.0.0",
+              "relationship": "rlhf-aligned",
+              "dataset": "human-feedback",
+              "date": "2024-02-01"
+            }
+          ]
+        }
+      ]
+    }
+
+---
+# Provenance Visualization
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: provenance-visualization
+  namespace: ml-models
+data:
+  visualize.py: |
+    #!/usr/bin/env python3
+    # Generate provenance graph with Graphviz
+
+    import json
+    import sys
+
+    provenance_file = sys.argv[1] if len(sys.argv) > 1 else "provenance.json"
+
+    with open(provenance_file) as f:
+        prov = json.load(f)
+
+    print("digraph ModelProvenance {")
+    print('  rankdir=LR;')
+    print('  node [shape=box];')
+
+    # Dataset node
+    dataset = prov["data"]["training_dataset"]["name"]
+    print(f'  "{dataset}" [label="{dataset}\\n{prov["data"]["training_dataset"]["num_samples"]} samples"];')
+
+    # Code node
+    code = f"Code\\n{prov['code']['commit'][:7]}"
+    print(f'  "{code}" [label="{code}"];')
+
+    # Model node
+    model = f"{prov['model']['name']}\\nv{prov['model']['version']}"
+    print(f'  "{model}" [label="{model}\\nAccuracy: {prov["results"]["metrics"]["accuracy"]}", style=filled, fillcolor=lightgreen];')
+
+    # Edges
+    print(f'  "{dataset}" -> "{model}";')
+    print(f'  "{code}" -> "{model}";')
+
+    print("}")
+
+---
+# Best Practices Summary:
+#
+# 1. Capture Everything:
+#    - Data: dataset name, version, SHA256, num samples
+#    - Code: git commit, repository, branch
+#    - Hyperparameters: learning rate, batch size, epochs
+#    - Infrastructure: GPU type, PyTorch version, CUDA
+#    - Results: accuracy, loss, artifacts
+#
+# 2. Storage:
+#    - ConfigMap: Small provenance (< 1MB)
+#    - S3: Large provenance, training logs
+#    - Database: Queryable provenance (PostgreSQL)
+#
+# 3. Standards:
+#    - SLSA provenance format
+#    - in-toto link metadata
+#    - ML-BOM (ML Bill of Materials)
+#
+# 4. Automation:
+#    - Capture during training (not manual)
+#    - Attach to model artifact (OCI image labels)
+#    - Sign with Cosign (tamper-proof)
+#
+# 5. Querying:
+#    - API: Query by trainer, accuracy, date
+#    - CLI: kubectl get cm -l model.name=llama2-7b
+#    - UI: Model registry (Harbor, MLflow)
+#
+# Real-world impact:
+# - 100% model reproducibility
+# - 0% "I don't know how this was trained"
+# - Instant debugging (trace accuracy drop to data change)
+# - Compliance: GDPR Article 22 (right to explanation)
+#
+# Example queries:
+# - "Show all models trained by alice@example.com"
+# - "Find models with accuracy > 90%"
+# - "What dataset was used for llama2-7b:1.0.0?"
+# - "What git commit produced this model?"
+# - "Re-train exact model (same data, code, hyperparameters)"
+#
+# Provenance answers:
+# Q: Why did accuracy drop from 92% to 88%?
+# A: Dataset changed from openwebtext-v1 (SHA256: abc123) to openwebtext-v2 (SHA256: def456)
+#
+# Q: Can we reproduce this model?
+# A: Yes. Git commit abc1234, openwebtext-v1 dataset, learning_rate=0.001, batch_size=32
+#
+# Q: Who trained this model?
+# A: alice@example.com on 2024-01-15 using 8x A100 GPUs
+#
+# Q: Is this model GDPR compliant?
+# A: Yes. Training dataset provenance shows opt-out handling.

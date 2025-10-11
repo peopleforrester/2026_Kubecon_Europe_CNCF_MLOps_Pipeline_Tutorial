@@ -1,0 +1,252 @@
+# ABOUTME: Spot instance configuration for GPU nodes with checkpoint strategy
+# ABOUTME: Achieves 70% cost savings while maintaining training reliability through checkpoints
+
+---
+# Spot Instance Strategy for GPU Training
+# Key principle: Checkpoint frequently, terminate gracefully, resume automatically
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-instance-best-practices
+  namespace: ml-training
+data:
+  README.md: |
+    # Spot Instance Best Practices for GPU Training
+
+    ## Cost Savings: 70% compared to on-demand
+
+    ### Spot Instance Pricing (Example: us-west-2)
+    - p3.2xlarge (V100): $3.06/hr on-demand → $0.918/hr spot (70% savings)
+    - p4d.24xlarge (A100 x8): $32.77/hr on-demand → $9.83/hr spot (70% savings)
+    - g4dn.xlarge (T4): $0.526/hr on-demand → $0.158/hr spot (70% savings)
+
+    ### The Spot Interruption Problem
+    Spot instances can be interrupted with 2-minute warning when AWS needs capacity back.
+
+    ### Solution: Checkpointing Strategy
+
+    1. **Save checkpoints every N steps** (e.g., every 100 steps)
+    2. **Listen for spot interruption signal** (AWS sends 2-minute warning)
+    3. **Save final checkpoint** when termination imminent
+    4. **Resume from checkpoint** on new spot instance
+
+    ### Implementation
+
+    See examples:
+    - components/02-training/examples/pytorch/spot-instance-training.yaml
+    - components/02-training/examples/tensorflow/tf-checkpoint-strategy.yaml
+
+---
+# Karpenter Provisioner with Spot Preference
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: spot-gpu-provisioner
+spec:
+  requirements:
+    # Prioritize spot instances
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values:
+        - spot  # Only use spot instances (higher risk, higher savings)
+
+    # GPU instance types
+    - key: karpenter.k8s.aws/instance-family
+      operator: In
+      values:
+        - p3    # V100
+        - g4dn  # T4 (most cost-effective for inference)
+
+  # Lower limits for spot-only provisioner (fallback to on-demand provisioner)
+  limits:
+    resources:
+      nvidia.com/gpu: "16"
+
+  # Shorter TTL for spot instances
+  ttlSecondsAfterEmpty: 180  # 3 minutes (faster scale-down)
+
+  providerRef:
+    name: spot-node-template
+
+  weight: 20  # Higher priority than mixed provisioner
+
+---
+# Spot-Specific Node Template
+apiVersion: karpenter.k8s.aws/v1alpha1
+kind: AWSNodeTemplate
+metadata:
+  name: spot-node-template
+spec:
+  amiFamily: AL2
+
+  # User data with spot interruption handler
+  userData: |
+    #!/bin/bash
+    /etc/eks/bootstrap.sh eks-cluster-name --container-runtime containerd \
+      --kubelet-extra-args '--node-labels=nvidia.com/gpu.present=true,node-role=gpu-spot,karpenter.sh/capacity-type=spot'
+
+    # Install spot interruption handler
+    curl -fsSL https://github.com/aws/aws-node-termination-handler/releases/download/v1.20.0/linux-amd64-node-termination-handler \
+      -o /usr/local/bin/node-termination-handler
+    chmod +x /usr/local/bin/node-termination-handler
+
+    # Start node termination handler as systemd service
+    cat > /etc/systemd/system/node-termination-handler.service <<EOF
+    [Unit]
+    Description=AWS Node Termination Handler
+    After=network.target
+
+    [Service]
+    Type=simple
+    ExecStart=/usr/local/bin/node-termination-handler --node-name=$(hostname) --pod-termination-grace-period=120
+    Restart=always
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+    systemctl daemon-reload
+    systemctl enable node-termination-handler
+    systemctl start node-termination-handler
+
+  tags:
+    Name: "karpenter-spot-gpu-node"
+    CapacityType: "spot"
+    CostOptimized: "true"
+
+---
+# Training Job Template for Spot Instances
+# This shows the pattern all training jobs on spot should follow
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spot-training-template
+  namespace: ml-training
+  annotations:
+    # Annotation to enable automatic checkpoint saving on spot interruption
+    spot.io/checkpoint-on-termination: "true"
+spec:
+  # Node selector for spot instances
+  nodeSelector:
+    karpenter.sh/capacity-type: spot
+
+  # Tolerations
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: karpenter.sh/capacity-type
+      operator: Equal
+      value: spot
+      effect: NoSchedule
+
+  # Restart policy: Never (rely on higher-level controller like Volcano to restart)
+  restartPolicy: Never
+
+  # Termination grace period: Time to save checkpoint before forced kill
+  terminationGracePeriodSeconds: 120  # 2 minutes
+
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.0.0-cuda11.8-cudnn8-runtime
+      command:
+        - python
+        - train.py
+        - --checkpoint-dir=/checkpoints
+        - --checkpoint-interval=100  # Save every 100 steps
+        - --resume-from-checkpoint=latest  # Auto-resume on restart
+
+      env:
+        # Environment variable to detect spot instance
+        - name: SPOT_INSTANCE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['karpenter.sh/capacity-type']
+
+      resources:
+        requests:
+          nvidia.com/gpu: 2
+          memory: "32Gi"
+        limits:
+          nvidia.com/gpu: 2
+          memory: "32Gi"
+
+      volumeMounts:
+        # Persistent checkpoint storage
+        - name: checkpoints
+          mountPath: /checkpoints
+
+      # Lifecycle hooks for graceful termination
+      lifecycle:
+        preStop:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - |
+                # Send SIGTERM to training process to trigger checkpoint save
+                echo "Spot interruption detected, saving checkpoint..."
+                kill -TERM 1
+                sleep 60  # Wait for checkpoint save
+
+  volumes:
+    - name: checkpoints
+      persistentVolumeClaim:
+        claimName: spot-training-checkpoints
+
+---
+# PersistentVolumeClaim for Checkpoints
+# Use fast SSD for checkpoint I/O performance
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spot-training-checkpoints
+  namespace: ml-training
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple pods can mount (for distributed training)
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: fast-ssd  # gp3 on AWS
+
+---
+# Cost Monitoring Alert for Spot Instances
+# Alert if spot savings drop below threshold (indicates over-reliance on on-demand)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: spot-cost-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: spot-instance-cost
+      interval: 5m
+      rules:
+        # Alert if spot instance percentage drops below 50%
+        - alert: LowSpotInstanceUsage
+          expr: |
+            (
+              sum(kube_node_labels{label_karpenter_sh_capacity_type="spot"})
+              /
+              sum(kube_node_labels{label_node_role="gpu-worker"})
+            ) < 0.5
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Low spot instance usage (< 50%)"
+            description: "Only {{ $value | humanizePercentage }} of GPU nodes are spot instances. Target: >50% for cost savings."
+
+        # Alert if training job fails >3 times in 1 hour (spot interruption storm)
+        - alert: FrequentSpotInterruptions
+          expr: |
+            sum(increase(kube_pod_status_phase{phase="Failed", namespace="ml-training"}[1h]))
+            > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Frequent training job failures (likely spot interruptions)"
+            description: "{{ $value }} training jobs failed in the last hour. Consider switching to on-demand or mixed capacity."

@@ -1,0 +1,196 @@
+# ABOUTME: Strimzi Kafka Operator installation for CNCF MLOps data pipeline
+# ABOUTME: Provides Kubernetes-native Kafka for real-time ML data ingestion and streaming
+
+---
+# Namespace for Strimzi Operator
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    app: strimzi
+
+---
+# Install Strimzi Operator using kubectl:
+# kubectl create -f 'https://strimzi.io/install/latest?namespace=kafka'
+#
+# Or apply this custom configuration with specific versions:
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: strimzi-cluster-operator
+  namespace: kafka
+  labels:
+    app: strimzi
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: strimzi-cluster-operator-namespaced
+  labels:
+    app: strimzi
+rules:
+  # Kafka cluster management
+  - apiGroups:
+      - "kafka.strimzi.io"
+    resources:
+      - kafkas
+      - kafkas/status
+      - kafkaconnects
+      - kafkaconnects/status
+      - kafkaconnectors
+      - kafkaconnectors/status
+      - kafkamirrormakers
+      - kafkamirrormakers/status
+      - kafkabridges
+      - kafkabridges/status
+      - kafkamirrormaker2s
+      - kafkamirrormaker2s/status
+      - kafkarebalances
+      - kafkarebalances/status
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+      - patch
+      - update
+  # StatefulSets, Deployments, Services
+  - apiGroups:
+      - "apps"
+    resources:
+      - deployments
+      - deployments/scale
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - services
+      - configmaps
+      - secrets
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+      - patch
+      - update
+  # Pod management
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: strimzi-cluster-operator
+  labels:
+    app: strimzi
+subjects:
+  - kind: ServiceAccount
+    name: strimzi-cluster-operator
+    namespace: kafka
+roleRef:
+  kind: ClusterRole
+  name: strimzi-cluster-operator-namespaced
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Strimzi Cluster Operator Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strimzi-cluster-operator
+  namespace: kafka
+  labels:
+    app: strimzi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: strimzi-cluster-operator
+      strimzi.io/kind: cluster-operator
+  template:
+    metadata:
+      labels:
+        name: strimzi-cluster-operator
+        strimzi.io/kind: cluster-operator
+    spec:
+      serviceAccountName: strimzi-cluster-operator
+      containers:
+        - name: strimzi-cluster-operator
+          image: quay.io/strimzi/operator:0.43.0  # Strimzi 0.43.0 (Latest stable)
+          args:
+            - /opt/strimzi/bin/cluster_operator_run.sh
+          env:
+            # Namespace to watch (use * for all namespaces)
+            - name: STRIMZI_NAMESPACE
+              value: kafka
+            # Kafka versions supported
+            - name: STRIMZI_KAFKA_IMAGES
+              value: |
+                3.7.0=quay.io/strimzi/kafka:0.43.0-kafka-3.7.0
+                3.6.1=quay.io/strimzi/kafka:0.43.0-kafka-3.6.1
+            # Kafka Connect images
+            - name: STRIMZI_KAFKA_CONNECT_IMAGES
+              value: |
+                3.7.0=quay.io/strimzi/kafka:0.43.0-kafka-3.7.0
+                3.6.1=quay.io/strimzi/kafka:0.43.0-kafka-3.6.1
+            # Full reconciliation interval
+            - name: STRIMZI_FULL_RECONCILIATION_INTERVAL_MS
+              value: "120000"  # 2 minutes
+            # Operation timeout
+            - name: STRIMZI_OPERATION_TIMEOUT_MS
+              value: "300000"  # 5 minutes
+            # Feature gates
+            - name: STRIMZI_FEATURE_GATES
+              value: "+UseKRaft,+KafkaNodePools"  # Enable KRaft and Node Pools
+          livenessProbe:
+            httpGet:
+              path: /healthy
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 200m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+
+---
+# Custom Resource Definitions (CRDs) for Strimzi
+# Note: In production, apply CRDs separately before operator
+# kubectl create -f https://strimzi.io/install/latest?namespace=kafka
+
+# Quick install command:
+# kubectl create namespace kafka
+# kubectl create -f 'https://strimzi.io/install/latest?namespace=kafka'
+# kubectl apply -f components/01-data-pipeline/strimzi/kafka-cluster.yaml -n kafka

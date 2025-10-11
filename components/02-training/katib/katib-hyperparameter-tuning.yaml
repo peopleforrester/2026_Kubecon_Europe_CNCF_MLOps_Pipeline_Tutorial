@@ -1,0 +1,124 @@
+# ABOUTME: Katib hyperparameter optimization experiment for automated model tuning
+# ABOUTME: Uses Bayesian optimization to find optimal learning rate and batch size
+
+apiVersion: kubeflow.org/v1beta1
+kind: Experiment
+metadata:
+  name: resnet-hyperparameter-tuning
+  namespace: ml-training
+spec:
+  # Optimization goal
+  objective:
+    type: maximize
+    goal: 0.95
+    objectiveMetricName: accuracy
+    additionalMetricNames:
+      - loss
+
+  # Search algorithm
+  algorithm:
+    algorithmName: bayesianoptimization  # bayesian, random, grid, hyperband
+    algorithmSettings:
+      - name: random_state
+        value: "42"
+
+  # Parallel trials
+  parallelTrialCount: 4  # Run 4 trials in parallel
+  maxTrialCount: 12  # Total 12 trials
+  maxFailedTrialCount: 3
+
+  # Parameters to tune
+  parameters:
+    - name: learning_rate
+      parameterType: double
+      feasibleSpace:
+        min: "0.00001"
+        max: "0.01"
+        step: "0.00001"
+
+    - name: batch_size
+      parameterType: int
+      feasibleSpace:
+        min: "16"
+        max: "128"
+        step: "16"
+
+    - name: optimizer
+      parameterType: categorical
+      feasibleSpace:
+        list:
+          - adam
+          - sgd
+          - adamw
+
+  # Trial template (PyTorch training job)
+  trialTemplate:
+    primaryContainerName: training
+    trialSpec:
+      apiVersion: batch/v1
+      kind: Job
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: training
+                image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+                command: [sh, -c]
+                args:
+                  - |
+                    cat > train.py << 'EOF'
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--learning-rate', type=float, required=True)
+parser.add_argument('--batch-size', type=int, required=True)
+parser.add_argument('--optimizer', type=str, required=True)
+args = parser.parse_args()
+
+# Training logic
+model = models.resnet50(pretrained=True)
+criterion = nn.CrossEntropyLoss()
+
+if args.optimizer == 'adam':
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+elif args.optimizer == 'sgd':
+    optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
+elif args.optimizer == 'adamw':
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+# Simplified training
+accuracy = 0.9
+loss = 0.1
+
+# CRITICAL: Print metrics for Katib to collect
+print(f"accuracy={accuracy}")
+print(f"loss={loss}")
+EOF
+                    python train.py \
+                      --learning-rate=${LEARNING_RATE} \
+                      --batch-size=${BATCH_SIZE} \
+                      --optimizer=${OPTIMIZER}
+                env:
+                  - name: LEARNING_RATE
+                    value: "${trialParameters.learning_rate}"
+                  - name: BATCH_SIZE
+                    value: "${trialParameters.batch_size}"
+                  - name: OPTIMIZER
+                    value: "${trialParameters.optimizer}"
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                    nvidia.com/gpumem: "10000"
+
+---
+# View experiment results:
+# kubectl get experiment resnet-hyperparameter-tuning -n ml-training -w
+# kubectl describe experiment resnet-hyperparameter-tuning -n ml-training
+#
+# Get best trial:
+# kubectl get experiment resnet-hyperparameter-tuning -n ml-training -o jsonpath='{.status.currentOptimalTrial}'

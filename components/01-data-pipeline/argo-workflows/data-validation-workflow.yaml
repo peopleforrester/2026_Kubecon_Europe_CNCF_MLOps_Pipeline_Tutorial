@@ -1,0 +1,561 @@
+# ABOUTME: Data validation workflow for ML pipeline quality assurance
+# ABOUTME: Schema validation, statistical checks, drift detection, and data quality alerts
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: data-validation-pipeline
+  namespace: argo
+  labels:
+    app: ml-data-pipeline
+    stage: validation
+spec:
+  serviceAccountName: workflow-submitter
+
+  templates:
+    # Main validation DAG
+    - name: validation-dag
+      inputs:
+        artifacts:
+          - name: dataset
+            path: /data/input.parquet
+          - name: reference-dataset
+            path: /data/reference.parquet
+            optional: true
+      dag:
+        tasks:
+          # Step 1: Schema validation
+          - name: validate-schema
+            template: schema-validation
+            arguments:
+              artifacts:
+                - name: dataset
+                  from: "{{inputs.artifacts.dataset}}"
+
+          # Step 2: Statistical validation (parallel)
+          - name: validate-statistics
+            template: statistical-validation
+            arguments:
+              artifacts:
+                - name: dataset
+                  from: "{{inputs.artifacts.dataset}}"
+
+          # Step 3: Data drift detection
+          - name: detect-drift
+            template: drift-detection
+            arguments:
+              artifacts:
+                - name: current-dataset
+                  from: "{{inputs.artifacts.dataset}}"
+                - name: reference-dataset
+                  from: "{{inputs.artifacts.reference-dataset}}"
+
+          # Step 4: Data quality report
+          - name: generate-report
+            dependencies: [validate-schema, validate-statistics, detect-drift]
+            template: quality-report
+            arguments:
+              artifacts:
+                - name: schema-results
+                  from: "{{tasks.validate-schema.outputs.artifacts.results}}"
+                - name: stats-results
+                  from: "{{tasks.validate-statistics.outputs.artifacts.results}}"
+                - name: drift-results
+                  from: "{{tasks.detect-drift.outputs.artifacts.results}}"
+
+          # Step 5: Alert if quality issues detected
+          - name: send-alerts
+            dependencies: [generate-report]
+            template: quality-alerts
+            arguments:
+              artifacts:
+                - name: report
+                  from: "{{tasks.generate-report.outputs.artifacts.report}}"
+
+    # Template: Schema validation
+    - name: schema-validation
+      inputs:
+        artifacts:
+          - name: dataset
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: results
+            path: /data/schema-results.json
+            s3:
+              key: "validation/schema/{{workflow.name}}/results.json"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow pandera
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            from datetime import datetime
+
+            # Load dataset
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Define expected schema
+            expected_schema = {
+                'id': 'int64',
+                'timestamp': 'datetime64[ns]',
+                'features': 'object',  # JSON or dict
+            }
+
+            # Validation results
+            results = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'total_records': len(df),
+                'total_columns': len(df.columns),
+                'schema_errors': []
+            }
+
+            # Check for required columns
+            for col, dtype in expected_schema.items():
+                if col not in df.columns:
+                    results['schema_errors'].append({
+                        'error': 'missing_column',
+                        'column': col,
+                        'expected_type': dtype
+                    })
+                elif str(df[col].dtype) != dtype and dtype != 'object':
+                    results['schema_errors'].append({
+                        'error': 'type_mismatch',
+                        'column': col,
+                        'expected_type': dtype,
+                        'actual_type': str(df[col].dtype)
+                    })
+
+            # Check for unexpected columns
+            unexpected_cols = set(df.columns) - set(expected_schema.keys())
+            if unexpected_cols:
+                results['unexpected_columns'] = list(unexpected_cols)
+
+            # Check for null values
+            null_counts = df.isnull().sum()
+            results['null_counts'] = null_counts[null_counts > 0].to_dict()
+
+            # Check for duplicate IDs
+            if 'id' in df.columns:
+                duplicates = df['id'].duplicated().sum()
+                if duplicates > 0:
+                    results['schema_errors'].append({
+                        'error': 'duplicate_ids',
+                        'count': int(duplicates)
+                    })
+
+            # Overall status
+            results['valid'] = len(results['schema_errors']) == 0
+
+            # Save results
+            with open('/data/schema-results.json', 'w') as f:
+                json.dump(results, f, indent=2)
+
+            print(f"Schema validation: {'PASS' if results['valid'] else 'FAIL'}")
+            print(f"Errors: {len(results['schema_errors'])}")
+
+            # Fail workflow if critical errors
+            if not results['valid']:
+                raise Exception(f"Schema validation failed with {len(results['schema_errors'])} errors")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Statistical validation
+    - name: statistical-validation
+      inputs:
+        artifacts:
+          - name: dataset
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: results
+            path: /data/stats-results.json
+            s3:
+              key: "validation/statistics/{{workflow.name}}/results.json"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scipy
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            import numpy as np
+            from datetime import datetime
+            from scipy import stats
+
+            # Load dataset
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Get numerical columns
+            numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+            results = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'total_records': len(df),
+                'statistical_checks': [],
+                'warnings': []
+            }
+
+            for col in numerical_cols:
+                col_stats = {
+                    'column': col,
+                    'mean': float(df[col].mean()),
+                    'median': float(df[col].median()),
+                    'std': float(df[col].std()),
+                    'min': float(df[col].min()),
+                    'max': float(df[col].max()),
+                    'q25': float(df[col].quantile(0.25)),
+                    'q75': float(df[col].quantile(0.75)),
+                }
+
+                # Check for outliers (IQR method)
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                outliers = ((df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR))).sum()
+                col_stats['outlier_count'] = int(outliers)
+                col_stats['outlier_percentage'] = float(outliers / len(df) * 100)
+
+                # Check for infinite values
+                inf_count = np.isinf(df[col]).sum()
+                if inf_count > 0:
+                    results['warnings'].append({
+                        'column': col,
+                        'issue': 'infinite_values',
+                        'count': int(inf_count)
+                    })
+
+                # Check for constant values
+                if df[col].nunique() == 1:
+                    results['warnings'].append({
+                        'column': col,
+                        'issue': 'constant_value',
+                        'value': float(df[col].iloc[0])
+                    })
+
+                # Check distribution (normality test)
+                if len(df) > 20:
+                    _, p_value = stats.normaltest(df[col].dropna())
+                    col_stats['normality_p_value'] = float(p_value)
+                    col_stats['is_normal'] = p_value > 0.05
+
+                results['statistical_checks'].append(col_stats)
+
+            # Check for high outlier rates
+            high_outlier_cols = [
+                c for c in results['statistical_checks']
+                if c['outlier_percentage'] > 10
+            ]
+
+            if high_outlier_cols:
+                results['warnings'].append({
+                    'issue': 'high_outlier_rate',
+                    'columns': [c['column'] for c in high_outlier_cols]
+                })
+
+            # Overall status
+            results['valid'] = len(results['warnings']) < 5
+
+            # Save results
+            with open('/data/stats-results.json', 'w') as f:
+                json.dump(results, f, indent=2)
+
+            print(f"Statistical validation: {'PASS' if results['valid'] else 'WARNING'}")
+            print(f"Warnings: {len(results['warnings'])}")
+            EOF
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 8Gi
+            cpu: "4"
+
+    # Template: Data drift detection
+    - name: drift-detection
+      inputs:
+        artifacts:
+          - name: current-dataset
+            path: /data/current.parquet
+          - name: reference-dataset
+            path: /data/reference.parquet
+            optional: true
+      outputs:
+        artifacts:
+          - name: results
+            path: /data/drift-results.json
+            s3:
+              key: "validation/drift/{{workflow.name}}/results.json"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scipy
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            import numpy as np
+            from datetime import datetime
+            from scipy import stats
+            import os
+
+            # Load current dataset
+            df_current = pd.read_parquet('/data/current.parquet')
+
+            # Check if reference dataset exists
+            if not os.path.exists('/data/reference.parquet'):
+                results = {
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'drift_detected': False,
+                    'message': 'No reference dataset provided, skipping drift detection'
+                }
+            else:
+                df_reference = pd.read_parquet('/data/reference.parquet')
+
+                results = {
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'drift_checks': [],
+                    'drift_detected': False
+                }
+
+                # Get common numerical columns
+                numerical_cols = list(
+                    set(df_current.select_dtypes(include=['int64', 'float64']).columns) &
+                    set(df_reference.select_dtypes(include=['int64', 'float64']).columns)
+                )
+
+                for col in numerical_cols:
+                    # Kolmogorov-Smirnov test for distribution drift
+                    ks_stat, p_value = stats.ks_2samp(
+                        df_reference[col].dropna(),
+                        df_current[col].dropna()
+                    )
+
+                    # Calculate mean shift
+                    mean_shift = abs(
+                        df_current[col].mean() - df_reference[col].mean()
+                    ) / df_reference[col].std() if df_reference[col].std() > 0 else 0
+
+                    drift_check = {
+                        'column': col,
+                        'ks_statistic': float(ks_stat),
+                        'p_value': float(p_value),
+                        'mean_shift': float(mean_shift),
+                        'drift_detected': p_value < 0.05 or mean_shift > 0.5
+                    }
+
+                    results['drift_checks'].append(drift_check)
+
+                    if drift_check['drift_detected']:
+                        results['drift_detected'] = True
+
+                # Check categorical columns
+                categorical_cols = list(
+                    set(df_current.select_dtypes(include=['object', 'category']).columns) &
+                    set(df_reference.select_dtypes(include=['object', 'category']).columns)
+                )
+
+                for col in categorical_cols:
+                    # Check if new categories appeared
+                    ref_cats = set(df_reference[col].unique())
+                    curr_cats = set(df_current[col].unique())
+
+                    new_cats = curr_cats - ref_cats
+                    missing_cats = ref_cats - curr_cats
+
+                    if new_cats or missing_cats:
+                        results['drift_checks'].append({
+                            'column': col,
+                            'type': 'categorical',
+                            'new_categories': list(new_cats),
+                            'missing_categories': list(missing_cats),
+                            'drift_detected': True
+                        })
+                        results['drift_detected'] = True
+
+            # Save results
+            with open('/data/drift-results.json', 'w') as f:
+                json.dump(results, f, indent=2)
+
+            print(f"Drift detection: {'DRIFT DETECTED' if results['drift_detected'] else 'NO DRIFT'}")
+            EOF
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 8Gi
+            cpu: "4"
+
+    # Template: Generate quality report
+    - name: quality-report
+      inputs:
+        artifacts:
+          - name: schema-results
+            path: /data/schema.json
+          - name: stats-results
+            path: /data/stats.json
+          - name: drift-results
+            path: /data/drift.json
+      outputs:
+        artifacts:
+          - name: report
+            path: /data/report.json
+            s3:
+              key: "validation/reports/{{workflow.name}}/report.json"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            python3 << 'EOF'
+            import json
+            from datetime import datetime
+
+            # Load all validation results
+            with open('/data/schema.json', 'r') as f:
+                schema_results = json.load(f)
+
+            with open('/data/stats.json', 'r') as f:
+                stats_results = json.load(f)
+
+            with open('/data/drift.json', 'r') as f:
+                drift_results = json.load(f)
+
+            # Aggregate report
+            report = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'workflow_name': '{{workflow.name}}',
+                'summary': {
+                    'schema_valid': schema_results.get('valid', False),
+                    'statistics_valid': stats_results.get('valid', True),
+                    'drift_detected': drift_results.get('drift_detected', False),
+                    'overall_quality': 'PASS'
+                },
+                'details': {
+                    'schema': schema_results,
+                    'statistics': stats_results,
+                    'drift': drift_results
+                }
+            }
+
+            # Determine overall quality
+            if not schema_results.get('valid', False):
+                report['summary']['overall_quality'] = 'FAIL'
+            elif drift_results.get('drift_detected', False):
+                report['summary']['overall_quality'] = 'WARNING'
+            elif not stats_results.get('valid', True):
+                report['summary']['overall_quality'] = 'WARNING'
+
+            # Save report
+            with open('/data/report.json', 'w') as f:
+                json.dump(report, f, indent=2)
+
+            print(f"Data Quality Report:")
+            print(f"  Schema: {'✓ PASS' if report['summary']['schema_valid'] else '✗ FAIL'}")
+            print(f"  Statistics: {'✓ PASS' if report['summary']['statistics_valid'] else '⚠ WARNING'}")
+            print(f"  Drift: {'⚠ DETECTED' if report['summary']['drift_detected'] else '✓ NO DRIFT'}")
+            print(f"  Overall: {report['summary']['overall_quality']}")
+            EOF
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.5"
+          limits:
+            memory: 1Gi
+            cpu: "1"
+
+    # Template: Send quality alerts
+    - name: quality-alerts
+      inputs:
+        artifacts:
+          - name: report
+            path: /data/report.json
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q kafka-python-ng
+            python3 << 'EOF'
+            import json
+            from kafka import KafkaProducer
+
+            # Load report
+            with open('/data/report.json', 'r') as f:
+                report = json.load(f)
+
+            # Check if alerts needed
+            quality = report['summary']['overall_quality']
+
+            if quality in ['FAIL', 'WARNING']:
+                # Send alert to Kafka
+                producer = KafkaProducer(
+                    bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+                )
+
+                alert = {
+                    'type': 'data_quality_alert',
+                    'severity': 'high' if quality == 'FAIL' else 'medium',
+                    'workflow': '{{workflow.name}}',
+                    'summary': report['summary'],
+                    'timestamp': report['timestamp']
+                }
+
+                producer.send('ml-data-quality', value=alert)
+                producer.flush()
+                producer.close()
+
+                print(f"🚨 Alert sent: Data quality {quality}")
+
+                # Optionally fail workflow if FAIL
+                if quality == 'FAIL':
+                    raise Exception(f"Data quality check failed: {quality}")
+            else:
+                print(f"✓ Data quality: {quality} (no alerts needed)")
+            EOF
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: "0.25"
+          limits:
+            memory: 512Mi
+            cpu: "0.5"
+
+---
+# Example: Submit validation workflow
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: data-validation-
+  namespace: argo
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      steps:
+        - - name: validate
+            templateRef:
+              name: data-validation-pipeline
+              template: validation-dag
+            arguments:
+              artifacts:
+                - name: dataset
+                  s3:
+                    key: "datasets/current/data.parquet"
+                - name: reference-dataset
+                  s3:
+                    key: "datasets/reference/baseline.parquet"

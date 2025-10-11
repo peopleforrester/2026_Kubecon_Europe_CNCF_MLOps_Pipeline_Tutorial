@@ -1,0 +1,475 @@
+# ABOUTME: Complete end-to-end ML data pipeline example using Kafka and Argo Workflows
+# ABOUTME: Demonstrates data ingestion, validation, preprocessing, feature engineering, and quality monitoring
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: end-to-end-ml-pipeline-
+  namespace: argo
+  labels:
+    app: ml-data-pipeline
+    example: end-to-end
+spec:
+  # Service account with appropriate permissions
+  serviceAccountName: workflow-submitter
+
+  # Workflow entry point
+  entrypoint: complete-pipeline
+
+  # Arguments
+  arguments:
+    parameters:
+      - name: dataset-name
+        value: "customer-transactions"
+      - name: kafka-topic-raw
+        value: "ml-raw-data"
+      - name: kafka-topic-processed
+        value: "ml-processed-features"
+      - name: batch-size
+        value: "1000"
+
+  # Shared volume for artifacts
+  volumeClaimTemplates:
+    - metadata:
+        name: pipeline-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+
+  templates:
+    # Main pipeline DAG
+    - name: complete-pipeline
+      dag:
+        tasks:
+          # Phase 1: Data Ingestion
+          - name: generate-sample-data
+            template: generate-data
+
+          - name: publish-to-kafka
+            dependencies: [generate-sample-data]
+            template: publish-raw-data
+            arguments:
+              artifacts:
+                - name: dataset
+                  from: "{{tasks.generate-sample-data.outputs.artifacts.dataset}}"
+
+          # Phase 2: Data Validation
+          - name: fetch-from-kafka
+            dependencies: [publish-to-kafka]
+            template: fetch-raw-data
+
+          - name: validate-schema
+            dependencies: [fetch-from-kafka]
+            templateRef:
+              name: data-validation-pipeline
+              template: schema-validation
+            arguments:
+              artifacts:
+                - name: dataset
+                  from: "{{tasks.fetch-from-kafka.outputs.artifacts.raw-data}}"
+
+          - name: validate-statistics
+            dependencies: [fetch-from-kafka]
+            templateRef:
+              name: data-validation-pipeline
+              template: statistical-validation
+            arguments:
+              artifacts:
+                - name: dataset
+                  from: "{{tasks.fetch-from-kafka.outputs.artifacts.raw-data}}"
+
+          # Phase 3: Data Preprocessing
+          - name: clean-data
+            dependencies: [validate-schema, validate-statistics]
+            template: data-cleaning
+            arguments:
+              artifacts:
+                - name: validated-data
+                  from: "{{tasks.fetch-from-kafka.outputs.artifacts.raw-data}}"
+
+          # Phase 4: Feature Engineering
+          - name: scale-features
+            dependencies: [clean-data]
+            templateRef:
+              name: feature-engineering-library
+              template: numerical-scaling
+            arguments:
+              parameters:
+                - name: method
+                  value: "standard"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.clean-data.outputs.artifacts.clean-data}}"
+
+          - name: encode-categoricals
+            dependencies: [scale-features]
+            templateRef:
+              name: feature-engineering-library
+              template: categorical-encoding
+            arguments:
+              parameters:
+                - name: method
+                  value: "onehot"
+                - name: max-categories
+                  value: "50"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.scale-features.outputs.artifacts.scaled-data}}"
+
+          - name: select-features
+            dependencies: [encode-categoricals]
+            templateRef:
+              name: feature-engineering-library
+              template: feature-selection
+            arguments:
+              parameters:
+                - name: method
+                  value: "variance"
+                - name: k-features
+                  value: "100"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.encode-categoricals.outputs.artifacts.encoded-data}}"
+
+          # Phase 5: Publish Results
+          - name: publish-features
+            dependencies: [select-features]
+            template: publish-processed-features
+            arguments:
+              artifacts:
+                - name: features
+                  from: "{{tasks.select-features.outputs.artifacts.selected-data}}"
+
+          # Phase 6: Quality Monitoring
+          - name: publish-metrics
+            dependencies: [publish-features]
+            template: publish-quality-metrics
+            arguments:
+              parameters:
+                - name: validation-status
+                  value: "{{tasks.validate-schema.outputs.result}}"
+                - name: stats-status
+                  value: "{{tasks.validate-statistics.outputs.result}}"
+
+    # Template: Generate sample data
+    - name: generate-data
+      outputs:
+        artifacts:
+          - name: dataset
+            path: /data/dataset.parquet
+            s3:
+              key: "examples/{{workflow.name}}/raw-data.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow numpy
+            python3 << 'EOF'
+            import pandas as pd
+            import numpy as np
+            from datetime import datetime, timedelta
+
+            np.random.seed(42)
+
+            # Generate synthetic customer transaction data
+            n_samples = int('{{workflow.parameters.batch-size}}')
+
+            data = {
+                'id': range(n_samples),
+                'timestamp': pd.date_range(start='2024-01-01', periods=n_samples, freq='1min'),
+                'customer_id': np.random.randint(1000, 9999, n_samples),
+                'amount': np.abs(np.random.randn(n_samples) * 100 + 50),
+                'merchant_category': np.random.choice(['grocery', 'gas', 'restaurant', 'retail'], n_samples),
+                'is_online': np.random.choice([0, 1], n_samples),
+                'distance_from_home': np.abs(np.random.randn(n_samples) * 20),
+                'hour_of_day': [int((datetime(2024, 1, 1) + timedelta(minutes=i)).hour) for i in range(n_samples)]
+            }
+
+            df = pd.DataFrame(data)
+
+            # Save to parquet
+            df.to_parquet('/data/dataset.parquet', index=False)
+
+            print(f"Generated {len(df)} sample transactions")
+            print(f"Columns: {list(df.columns)}")
+            print(f"Shape: {df.shape}")
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Publish to Kafka raw data topic
+    - name: publish-raw-data
+      inputs:
+        artifacts:
+          - name: dataset
+            path: /data/dataset.parquet
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow kafka-python-ng
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            from kafka import KafkaProducer
+
+            # Load dataset
+            df = pd.read_parquet('/data/dataset.parquet')
+
+            # Convert to JSON records
+            records = df.to_dict(orient='records')
+
+            # Kafka producer
+            producer = KafkaProducer(
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                value_serializer=lambda v: json.dumps(v, default=str).encode('utf-8')
+            )
+
+            # Publish to raw data topic
+            for record in records:
+                producer.send('{{workflow.parameters.kafka-topic-raw}}', value=record)
+
+            producer.flush()
+            producer.close()
+
+            print(f"Published {len(records)} records to Kafka topic: {{workflow.parameters.kafka-topic-raw}}")
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Fetch from Kafka
+    - name: fetch-raw-data
+      outputs:
+        artifacts:
+          - name: raw-data
+            path: /data/raw-data.parquet
+            s3:
+              key: "examples/{{workflow.name}}/fetched-data.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow kafka-python-ng
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            from kafka import KafkaConsumer
+
+            # Kafka consumer
+            consumer = KafkaConsumer(
+                '{{workflow.parameters.kafka-topic-raw}}',
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                group_id='{{workflow.name}}',
+                auto_offset_reset='earliest',
+                enable_auto_commit=False,
+                max_poll_records=int('{{workflow.parameters.batch-size}}'),
+                value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+            )
+
+            # Fetch records
+            records = []
+            for message in consumer:
+                records.append(message.value)
+                if len(records) >= int('{{workflow.parameters.batch-size}}'):
+                    break
+
+            consumer.commit()
+            consumer.close()
+
+            # Convert to DataFrame
+            df = pd.DataFrame(records)
+
+            # Save to parquet
+            df.to_parquet('/data/raw-data.parquet', index=False)
+
+            print(f"Fetched {len(df)} records from Kafka")
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Data cleaning
+    - name: data-cleaning
+      inputs:
+        artifacts:
+          - name: validated-data
+            path: /data/validated.parquet
+      outputs:
+        artifacts:
+          - name: clean-data
+            path: /data/clean.parquet
+            s3:
+              key: "examples/{{workflow.name}}/clean-data.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+            import numpy as np
+
+            # Load data
+            df = pd.read_parquet('/data/validated.parquet')
+
+            # Clean data
+            # 1. Remove duplicates
+            df = df.drop_duplicates(subset=['id'])
+
+            # 2. Handle missing values
+            for col in df.columns:
+                if df[col].dtype in ['float64', 'int64']:
+                    df[col].fillna(df[col].median(), inplace=True)
+                else:
+                    df[col].fillna('unknown', inplace=True)
+
+            # 3. Remove outliers (IQR method for numerical columns)
+            for col in df.select_dtypes(include=['float64', 'int64']).columns:
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 3 * IQR
+                upper_bound = Q3 + 3 * IQR
+                df[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
+
+            # Save clean data
+            df.to_parquet('/data/clean.parquet', index=False)
+
+            print(f"Cleaned data: {len(df)} records")
+            print(f"Columns: {list(df.columns)}")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Publish processed features
+    - name: publish-processed-features
+      inputs:
+        artifacts:
+          - name: features
+            path: /data/features.parquet
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow kafka-python-ng
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            from kafka import KafkaProducer
+
+            # Load features
+            df = pd.read_parquet('/data/features.parquet')
+
+            # Convert to JSON records
+            records = df.to_dict(orient='records')
+
+            # Kafka producer
+            producer = KafkaProducer(
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                value_serializer=lambda v: json.dumps(v, default=str).encode('utf-8')
+            )
+
+            # Publish to processed features topic
+            for record in records:
+                producer.send('{{workflow.parameters.kafka-topic-processed}}', value=record)
+
+            producer.flush()
+            producer.close()
+
+            print(f"Published {len(records)} feature records to Kafka topic: {{workflow.parameters.kafka-topic-processed}}")
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Publish quality metrics
+    - name: publish-quality-metrics
+      inputs:
+        parameters:
+          - name: validation-status
+          - name: stats-status
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q kafka-python-ng
+            python3 << 'EOF'
+            import json
+            from datetime import datetime
+            from kafka import KafkaProducer
+
+            # Create quality metrics
+            metrics = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'workflow_name': '{{workflow.name}}',
+                'dataset_name': '{{workflow.parameters.dataset-name}}',
+                'validation_status': '{{inputs.parameters.validation-status}}',
+                'statistics_status': '{{inputs.parameters.stats-status}}',
+                'batch_size': int('{{workflow.parameters.batch-size}}'),
+                'pipeline_stage': 'complete'
+            }
+
+            # Kafka producer
+            producer = KafkaProducer(
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+
+            # Publish to quality metrics topic
+            producer.send('ml-data-quality', value=metrics)
+            producer.flush()
+            producer.close()
+
+            print(f"Published quality metrics to Kafka")
+            print(f"Metrics: {json.dumps(metrics, indent=2)}")
+            EOF
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: "0.25"
+          limits:
+            memory: 512Mi
+            cpu: "0.5"
+
+---
+# Quick submit command:
+# kubectl create -f examples/end-to-end-pipeline.yaml -n argo
+#
+# Monitor workflow:
+# kubectl get workflows -n argo -w
+# kubectl logs -n argo -f <workflow-pod-name>
+#
+# Access Argo UI:
+# kubectl -n argo port-forward svc/argo-server 2746:2746
+# Open https://localhost:2746

@@ -1,0 +1,286 @@
+# ABOUTME: PyTorch Distributed Data Parallel (DDP) multi-node training with Volcano gang scheduling
+# ABOUTME: Prevents deadlocks with gang scheduling, supports 8-node 64-GPU training for LLMs
+
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: pytorch-ddp-llama2-13b
+  namespace: ml-training
+  labels:
+    app: llama2-training
+    framework: pytorch
+    distribution: ddp
+spec:
+  # CRITICAL: Use Volcano for gang scheduling
+  schedulerName: volcano
+  minAvailable: 8  # All 8 nodes must start together (prevents deadlock)
+
+  queue: training
+  priorityClassName: ml-high
+
+  # Retry on failures
+  maxRetry: 3
+
+  # Task: 8 worker nodes, each with 8 GPUs
+  tasks:
+    - replicas: 8
+      name: worker
+      template:
+        metadata:
+          labels:
+            app: pytorch-worker
+            role: trainer
+        spec:
+          restartPolicy: OnFailure
+
+          # Node affinity: spread across different physical nodes
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: app
+                        operator: In
+                        values:
+                          - pytorch-worker
+                  topologyKey: kubernetes.io/hostname
+
+          containers:
+            - name: pytorch-trainer
+              image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+              command: [sh, -c]
+              args:
+                - |
+                  set -e
+
+                  # Get rank from Volcano task index
+                  export RANK="${VC_TASK_INDEX}"
+                  export WORLD_SIZE="8"
+                  export MASTER_ADDR="pytorch-ddp-llama2-13b-worker-0.pytorch-ddp-llama2-13b"
+                  export MASTER_PORT="23456"
+
+                  # NCCL configuration for multi-node
+                  export NCCL_DEBUG=INFO
+                  export NCCL_IB_DISABLE=0  # Enable InfiniBand if available
+                  export NCCL_SOCKET_IFNAME=eth0
+                  export NCCL_ASYNC_ERROR_HANDLING=1
+
+                  echo "=========================================="
+                  echo "PyTorch DDP Multi-Node Training"
+                  echo "=========================================="
+                  echo "Rank: ${RANK}/${WORLD_SIZE}"
+                  echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
+                  echo "GPUs per node: 8"
+                  echo "Total GPUs: 64"
+                  echo "=========================================="
+
+                  # Install dependencies
+                  pip install -q transformers datasets accelerate
+
+                  # Training script
+                  cat > train_llama2.py << 'EOF'
+import os
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from datasets import load_dataset
+
+def setup_distributed():
+    """Initialize distributed training"""
+    dist.init_process_group(backend='nccl')
+
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+
+    return local_rank
+
+def cleanup_distributed():
+    """Cleanup distributed training"""
+    dist.destroy_process_group()
+
+def main():
+    # Setup
+    local_rank = setup_distributed()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    print(f"[Rank {rank}] Starting training on GPU {local_rank}")
+
+    # Load model (LLaMA-2 13B)
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-13b-hf",
+        torch_dtype=torch.bfloat16,  # Mixed precision
+        device_map={"": local_rank}
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-13b-hf")
+
+    # Load dataset
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir="./llama2-13b-finetuned",
+        per_device_train_batch_size=2,  # Per GPU batch size
+        gradient_accumulation_steps=8,   # Effective batch = 2 * 8 * 64 = 1024
+        learning_rate=2e-5,
+        num_train_epochs=3,
+        fp16=False,
+        bf16=True,  # BFloat16 for better stability
+        save_steps=100,
+        logging_steps=10,
+        ddp_find_unused_parameters=False,
+        local_rank=local_rank,
+    )
+
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        tokenizer=tokenizer,
+    )
+
+    # Train
+    if rank == 0:
+        print(f"Starting training with {world_size} GPUs...")
+
+    trainer.train()
+
+    # Cleanup
+    cleanup_distributed()
+
+    if rank == 0:
+        print("Training complete!")
+        trainer.save_model("./llama2-13b-finetuned-final")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+                  # Launch distributed training
+                  # torchrun automatically sets LOCAL_RANK, RANK, WORLD_SIZE
+                  torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=${WORLD_SIZE} \
+                    --node_rank=${RANK} \
+                    --master_addr=${MASTER_ADDR} \
+                    --master_port=${MASTER_PORT} \
+                    train_llama2.py
+
+                  echo "Training complete on rank ${RANK}"
+
+              env:
+                - name: VC_TASK_INDEX
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['volcano.sh/task-index']
+
+                # HuggingFace token for model download
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: huggingface-token
+                      key: token
+                      optional: true
+
+              # Volume mounts for checkpoints
+              volumeMounts:
+                - name: checkpoint-storage
+                  mountPath: /workspace/checkpoints
+                - name: shm
+                  mountPath: /dev/shm  # Shared memory for NCCL
+
+              resources:
+                requests:
+                  cpu: "32"
+                  memory: "256Gi"
+                  nvidia.com/gpu: "8"  # 8 GPUs per node
+                limits:
+                  cpu: "64"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"
+
+          volumes:
+            - name: checkpoint-storage
+              persistentVolumeClaim:
+                claimName: training-checkpoints
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Gi  # Large shared memory for NCCL
+
+---
+# PersistentVolumeClaim for checkpoints
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-checkpoints
+  namespace: ml-training
+spec:
+  accessModes:
+    - ReadWriteMany  # Shared across all nodes
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: nfs  # Use NFS or similar for multi-node access
+
+---
+# Service for worker-0 (master node)
+apiVersion: v1
+kind: Service
+metadata:
+  name: pytorch-ddp-llama2-13b
+  namespace: ml-training
+spec:
+  clusterIP: None  # Headless service
+  selector:
+    volcano.sh/job-name: pytorch-ddp-llama2-13b
+    volcano.sh/task-name: worker
+  ports:
+    - port: 23456
+      name: master
+      protocol: TCP
+
+---
+# Example: Monitor training progress
+# kubectl logs -n ml-training -l volcano.sh/job-name=pytorch-ddp-llama2-13b -f
+#
+# Check NCCL communication:
+# kubectl logs -n ml-training pytorch-ddp-llama2-13b-worker-0 | grep NCCL
+#
+# Verify gang scheduling prevented deadlock:
+# kubectl get pods -n ml-training -l volcano.sh/job-name=pytorch-ddp-llama2-13b
+# All 8 pods should start together or none at all
+
+---
+# Performance Optimization Tips:
+#
+# 1. NCCL Configuration:
+#    - NCCL_IB_DISABLE=0: Enable InfiniBand (5x faster than Ethernet)
+#    - NCCL_SOCKET_IFNAME=ib0: Use InfiniBand interface
+#    - NCCL_DEBUG=INFO: Debug communication issues
+#
+# 2. Gradient Accumulation:
+#    - Batch size too large → OOM
+#    - Use gradient accumulation to simulate larger batches
+#    - Effective batch = per_device_batch * gradient_accum_steps * world_size
+#
+# 3. Mixed Precision:
+#    - fp16: Faster, less memory, less stable
+#    - bf16: Faster, less memory, more stable (recommended for LLMs)
+#
+# 4. Shared Memory:
+#    - NCCL uses /dev/shm for inter-GPU communication
+#    - Default 64MB is too small → set to 64GB
+#
+# 5. Checkpointing:
+#    - Save checkpoints every N steps (save_steps=100)
+#    - Use ReadWriteMany PVC for multi-node access
+#    - Resume from checkpoint on failure (max_retry=3)
+#
+# Expected throughput:
+# - LLaMA-2 13B on 8x A100 (80GB): ~150 tokens/sec/GPU = 1200 tokens/sec total
+# - LLaMA-2 13B on 64x A100 (8 nodes): ~9600 tokens/sec
+# - Training time for 100B tokens: ~3 hours (vs 24 hours on single node)

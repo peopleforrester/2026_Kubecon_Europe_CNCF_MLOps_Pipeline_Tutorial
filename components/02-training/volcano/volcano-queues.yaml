@@ -1,0 +1,234 @@
+# ABOUTME: Volcano queue configurations for ML training job resource management
+# ABOUTME: Queues provide resource quotas, priorities, and fair sharing across teams and workloads
+
+---
+# Queue: Default (for development and experimentation)
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: default
+spec:
+  weight: 1  # Lowest priority
+  capability:
+    cpu: "100"
+    memory: "200Gi"
+    nvidia.com/gpu: "8"  # Max 8 GPUs for default queue
+  reclaimable: true  # Can reclaim resources from this queue
+  state: Open  # Open, Closed, or Unknown
+
+---
+# Queue: Training (for production training jobs)
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: training
+spec:
+  weight: 10  # Higher priority than default
+  capability:
+    cpu: "500"
+    memory: "1Ti"
+    nvidia.com/gpu: "32"  # Up to 32 GPUs (e.g., 4x A100 nodes)
+  reclaimable: false  # Guaranteed resources, cannot be preempted
+  state: Open
+
+---
+# Queue: Inference (for model serving and batch inference)
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: inference
+spec:
+  weight: 5  # Medium priority
+  capability:
+    cpu: "200"
+    memory: "400Gi"
+    nvidia.com/gpu: "16"
+  reclaimable: true
+  state: Open
+
+---
+# Queue: Research (for experimental workloads, can be preempted)
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: research
+spec:
+  weight: 3  # Lower than production training
+  capability:
+    cpu: "300"
+    memory: "600Gi"
+    nvidia.com/gpu: "24"
+  reclaimable: true  # Research jobs can be preempted by training
+  state: Open
+
+---
+# Queue: HPO (Hyperparameter optimization with many parallel trials)
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: hpo
+spec:
+  weight: 7  # High priority (time-sensitive experiments)
+  capability:
+    cpu: "400"
+    memory: "800Gi"
+    nvidia.com/gpu: "40"  # Many small jobs in parallel
+  reclaimable: false  # Don't interrupt hyperparameter sweeps
+  state: Open
+
+---
+# PriorityClass: Critical (for urgent retraining)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-critical
+value: 1000000  # Highest priority
+globalDefault: false
+description: "Critical ML jobs (production model retraining, incident response)"
+
+---
+# PriorityClass: High (production training)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-high
+value: 100000
+globalDefault: false
+description: "Production training jobs"
+
+---
+# PriorityClass: Medium (experimentation)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-medium
+value: 10000
+globalDefault: false
+description: "Experimental training and hyperparameter tuning"
+
+---
+# PriorityClass: Low (batch inference, research)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-low
+value: 1000
+globalDefault: false
+description: "Research jobs and batch inference (can be preempted)"
+
+---
+# PriorityClass: Best-effort (spot instances)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ml-spot
+value: 100
+globalDefault: false
+description: "Jobs running on spot instances (lowest priority)"
+preemptionPolicy: Never  # Don't preempt other jobs
+
+---
+# Example: Using queues and priorities in a Volcano job
+# apiVersion: batch.volcano.sh/v1alpha1
+# kind: Job
+# metadata:
+#   name: llama2-training
+# spec:
+#   schedulerName: volcano
+#   queue: training  # Use training queue
+#   priorityClassName: ml-high  # High priority
+#   minAvailable: 4  # Gang scheduling: all 4 workers or none
+#   tasks:
+#     - replicas: 4
+#       name: worker
+#       template:
+#         spec:
+#           containers:
+#             - name: trainer
+#               image: pytorch/pytorch:2.0-cuda11.7
+#               resources:
+#                 requests:
+#                   nvidia.com/gpu: 1
+
+---
+# ResourceQuota: Limit total GPU usage per namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-training-quota
+  namespace: ml-training
+spec:
+  hard:
+    requests.nvidia.com/gpu: "32"  # Max 32 GPUs for this namespace
+    requests.cpu: "500"
+    requests.memory: "1Ti"
+    persistentvolumeclaims: "50"
+
+---
+# LimitRange: Default limits per pod (prevent runaway jobs)
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: ml-training-limits
+  namespace: ml-training
+spec:
+  limits:
+    - max:
+        nvidia.com/gpu: "8"  # Max 8 GPUs per pod
+        cpu: "64"
+        memory: "256Gi"
+      min:
+        nvidia.com/gpu: "1"  # Min 1 GPU (ensure GPU pods don't run on CPU)
+        cpu: "1"
+        memory: "4Gi"
+      default:
+        nvidia.com/gpu: "1"  # Default 1 GPU
+        cpu: "8"
+        memory: "32Gi"
+      defaultRequest:
+        nvidia.com/gpu: "1"
+        cpu: "4"
+        memory: "16Gi"
+      type: Container
+
+---
+# Monitoring: Queue metrics for Prometheus
+# Volcano exposes queue metrics like:
+# - volcano_queue_allocated_resources{queue="training", resource="nvidia.com/gpu"}
+# - volcano_queue_used_resources{queue="training"}
+# - volcano_queue_pending_jobs{queue="training"}
+
+# Example Prometheus alert:
+# - alert: HighQueueUtilization
+#   expr: volcano_queue_used_resources{resource="nvidia.com/gpu"} / volcano_queue_allocated_resources > 0.9
+#   for: 30m
+#   annotations:
+#     summary: "Queue {{ $labels.queue }} GPU utilization > 90%"
+
+---
+# Queue usage guidelines:
+#
+# 1. Use 'training' queue for:
+#    - Production model training
+#    - Critical retraining (data drift detected)
+#    - Customer-facing model updates
+#
+# 2. Use 'hpo' queue for:
+#    - Hyperparameter optimization (Katib experiments)
+#    - Neural architecture search
+#    - AutoML workflows
+#
+# 3. Use 'research' queue for:
+#    - Experimental models
+#    - Feature engineering experiments
+#    - Proof-of-concept training
+#
+# 4. Use 'inference' queue for:
+#    - Batch inference jobs
+#    - Model evaluation on test sets
+#    - Feature extraction pipelines
+#
+# 5. Use 'default' queue for:
+#    - Development and debugging
+#    - Small-scale testing
+#    - Jupyter notebooks

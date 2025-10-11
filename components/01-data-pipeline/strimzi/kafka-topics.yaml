@@ -1,0 +1,158 @@
+# ABOUTME: Kafka topic definitions for ML data pipeline stages
+# ABOUTME: Topics for raw data ingestion, processed features, and model predictions
+
+---
+# Topic: Raw ML training data
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-raw-data
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 12  # 12 partitions for parallelism (matches Argo workflow parallelism)
+  replicas: 3     # 3 replicas for HA
+  config:
+    # Retention: 7 days (enough for retraining cycles)
+    retention.ms: 604800000  # 7 days in milliseconds
+    retention.bytes: 10737418240  # 10GB per partition
+
+    # Compression for large datasets
+    compression.type: snappy
+
+    # Segment size
+    segment.bytes: 1073741824  # 1GB segments
+
+    # Min in-sync replicas for durability
+    min.insync.replicas: 2
+
+    # Cleanup policy
+    cleanup.policy: delete  # Delete old data (vs compact for stateful data)
+
+---
+# Topic: Processed ML features ready for training
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-processed-features
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: 604800000  # 7 days
+    retention.bytes: 10737418240  # 10GB per partition
+    compression.type: snappy
+    segment.bytes: 1073741824
+    min.insync.replicas: 2
+    cleanup.policy: delete
+
+---
+# Topic: Model predictions (for monitoring and feedback loops)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-predictions
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 6  # Fewer partitions (prediction volume typically lower)
+  replicas: 3
+  config:
+    retention.ms: 2592000000  # 30 days (for model monitoring)
+    retention.bytes: 5368709120  # 5GB per partition
+    compression.type: snappy
+    segment.bytes: 536870912  # 512MB segments
+    min.insync.replicas: 2
+    cleanup.policy: delete
+
+---
+# Topic: Data quality metrics (for monitoring pipeline health)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-data-quality
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 3  # Low volume
+  replicas: 3
+  config:
+    retention.ms: 604800000  # 7 days
+    retention.bytes: 1073741824  # 1GB per partition
+    compression.type: snappy
+    segment.bytes: 268435456  # 256MB segments
+    min.insync.replicas: 2
+    cleanup.policy: delete
+
+---
+# Topic: Feature store updates (for online serving)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-feature-updates
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 6
+  replicas: 3
+  config:
+    # Longer retention for feature store synchronization
+    retention.ms: 1209600000  # 14 days
+    retention.bytes: 5368709120  # 5GB per partition
+
+    # Use log compaction to keep only latest feature values
+    cleanup.policy: compact
+    min.cleanable.dirty.ratio: 0.5
+    delete.retention.ms: 86400000  # 24 hours
+
+    compression.type: snappy
+    segment.bytes: 536870912
+    min.insync.replicas: 2
+
+---
+# Topic: Model retraining triggers (event-driven retraining)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-retrain-triggers
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 1  # Low volume, order matters
+  replicas: 3
+  config:
+    retention.ms: 604800000  # 7 days
+    retention.bytes: 107374182  # 100MB per partition
+    compression.type: snappy
+    segment.bytes: 52428800  # 50MB segments
+    min.insync.replicas: 2
+    cleanup.policy: delete
+
+---
+# Topic: Dead letter queue (for failed processing)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: ml-dlq
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-cluster
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    # Longer retention for debugging
+    retention.ms: 2592000000  # 30 days
+    retention.bytes: 1073741824  # 1GB per partition
+    compression.type: snappy
+    segment.bytes: 268435456
+    min.insync.replicas: 2
+    cleanup.policy: delete

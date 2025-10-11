@@ -1,0 +1,111 @@
+# ABOUTME: TensorFlow MultiWorkerMirroredStrategy distributed training with Volcano gang scheduling
+# ABOUTME: Parameter server and worker architecture for scalable TensorFlow training
+
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: tensorflow-bert-training
+  namespace: ml-training
+  labels:
+    framework: tensorflow
+    distribution: multiworker
+spec:
+  schedulerName: volcano
+  minAvailable: 5  # 1 chief + 4 workers
+  queue: training
+  priorityClassName: ml-high
+
+  tasks:
+    # Chief worker (rank 0)
+    - replicas: 1
+      name: chief
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: tensorflow
+              image: tensorflow/tensorflow:2.13.0-gpu
+              command: [sh, -c]
+              args:
+                - |
+                  cat > train.py << 'EOF'
+import os
+import json
+import tensorflow as tf
+from transformers import TFBertForSequenceClassification, BertTokenizer
+
+# TF_CONFIG automatically set by Volcano
+tf_config = json.loads(os.environ.get('TF_CONFIG', '{}'))
+print(f"TF_CONFIG: {tf_config}")
+
+# MultiWorkerMirroredStrategy for distributed training
+strategy = tf.distribute.MultiWorkerMirroredStrategy()
+
+with strategy.scope():
+    model = TFBertForSequenceClassification.from_pretrained('bert-base-uncased')
+    optimizer = tf.keras.optimizers.Adam(learning_rate=2e-5)
+    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# Training (simplified)
+print(f"Training BERT on {strategy.num_replicas_in_sync} workers")
+# model.fit(train_dataset, epochs=3)
+print("Training complete!")
+EOF
+                  python train.py
+              env:
+                - name: TF_CONFIG
+                  value: |
+                    {
+                      "cluster": {
+                        "chief": ["tensorflow-bert-training-chief-0:2222"],
+                        "worker": ["tensorflow-bert-training-worker-0:2222",
+                                  "tensorflow-bert-training-worker-1:2222",
+                                  "tensorflow-bert-training-worker-2:2222",
+                                  "tensorflow-bert-training-worker-3:2222"]
+                      },
+                      "task": {"type": "chief", "index": 0}
+                    }
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+
+    # Workers
+    - replicas: 4
+      name: worker
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: tensorflow
+              image: tensorflow/tensorflow:2.13.0-gpu
+              command: [sh, -c]
+              args:
+                - |
+                  cat > train.py << 'EOF'
+import os
+import json
+import tensorflow as tf
+from transformers import TFBertForSequenceClassification
+
+tf_config = json.loads(os.environ.get('TF_CONFIG'))
+strategy = tf.distribute.MultiWorkerMirroredStrategy()
+
+with strategy.scope():
+    model = TFBertForSequenceClassification.from_pretrained('bert-base-uncased')
+    optimizer = tf.keras.optimizers.Adam(learning_rate=2e-5)
+    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+print(f"Worker training on {strategy.num_replicas_in_sync} replicas")
+# model.fit(train_dataset, epochs=3)
+EOF
+                  WORKER_INDEX="${VC_TASK_INDEX}"
+                  export TF_CONFIG="{\"cluster\":{\"chief\":[\"tensorflow-bert-training-chief-0:2222\"],\"worker\":[\"tensorflow-bert-training-worker-0:2222\",\"tensorflow-bert-training-worker-1:2222\",\"tensorflow-bert-training-worker-2:2222\",\"tensorflow-bert-training-worker-3:2222\"]},\"task\":{\"type\":\"worker\",\"index\":${WORKER_INDEX}}}"
+                  python train.py
+              env:
+                - name: VC_TASK_INDEX
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['volcano.sh/task-index']
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"

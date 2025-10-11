@@ -1,0 +1,71 @@
+# ABOUTME: Main CI workflow for KubeCon 2026 MLOps tutorial repository
+# ABOUTME: Runs YAML validation, security scanning, and link checking on all PRs and pushes
+name: CI - Quality & Security Checks
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  yaml-validation:
+    name: YAML Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          VERSION="0.6.4"
+          wget -q "https://github.com/yannh/kubeconform/releases/download/v${VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar xzf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+          rm kubeconform-linux-amd64.tar.gz
+
+      - name: Validate YAML files
+        run: |
+          chmod +x scripts/validate-yaml.sh
+          ./scripts/validate-yaml.sh
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run security scan
+        run: |
+          chmod +x scripts/security-scan.sh
+          ./scripts/security-scan.sh
+
+  link-check:
+    name: Link Checking
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check links
+        run: |
+          chmod +x scripts/check-links.sh
+          ./scripts/check-links.sh
+
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [yaml-validation, security-scan, link-check]
+    if: always()
+    steps:
+      - name: Check CI status
+        run: |
+          if [ "${{ needs.yaml-validation.result }}" == "failure" ] || \
+             [ "${{ needs.security-scan.result }}" == "failure" ] || \
+             [ "${{ needs.link-check.result }}" == "failure" ]; then
+            echo "❌ CI checks failed"
+            exit 1
+          else
+            echo "✅ All CI checks passed"
+          fi

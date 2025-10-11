@@ -1,0 +1,110 @@
+# ABOUTME: Gitignore configuration for CNCF MLOps Pipeline KubeCon 2026 demo repository
+# ABOUTME: Excludes temporary files, credentials, local configs, and generated artifacts
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+.kube/
+
+# Credentials and secrets
+*.pem
+*.key
+*.crt
+credentials.yaml
+secrets.yaml
+*.env
+.env
+.env.local
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Harbor
+harbor-data/
+
+# Model files (too large for git)
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pb
+*.onnx
+*.safetensors
+models/weights/
+*.bin
+
+# Dataset files (too large for git)
+datasets/raw/
+datasets/processed/
+*.csv
+*.parquet
+*.arrow
+
+# Logs
+*.log
+logs/
+*.out
+
+# Cost reports (generated)
+cost-analysis/reports/
+*.xlsx~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Planning files (internal use only)
+_planning/
+
+# Keep directory structure
+!.gitkeep

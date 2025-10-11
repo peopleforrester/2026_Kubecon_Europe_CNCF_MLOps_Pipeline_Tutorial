@@ -1,0 +1,224 @@
+# ABOUTME: Minimum cluster requirements specification for CNCF MLOps pipeline deployment
+# ABOUTME: Use this as reference when provisioning Kubernetes clusters for ML workloads
+
+# Cluster Specifications (Minimum Requirements)
+cluster:
+  kubernetes_version: "1.28+"  # Tested on 1.28, 1.29, 1.30
+
+  # Node Pools
+  node_pools:
+    # GPU Node Pool (for training and inference)
+    - name: gpu-nodes
+      min_nodes: 2  # Minimum for distributed training with gang scheduling
+      max_nodes: 10  # Adjust based on workload
+      machine_type:
+        aws: "p3.2xlarge"  # NVIDIA V100 16GB
+        gcp: "n1-standard-16-nvidia-tesla-v100"
+        azure: "Standard_NC6s_v3"
+      gpu:
+        type: "nvidia-tesla-v100"  # Or A100, T4, H100
+        count_per_node: 1
+        memory: "16GB"  # Per GPU
+      cpu: 8  # vCPUs per node
+      memory: "61GB"  # System memory per node
+      disk: "200GB"  # Boot disk
+      labels:
+        nvidia.com/gpu.present: "true"
+        node-role: "gpu-worker"
+      taints:
+        - key: "nvidia.com/gpu"
+          value: "true"
+          effect: "NoSchedule"  # Reserve for GPU workloads only
+
+    # CPU Node Pool (for control plane, data pipeline, observability)
+    - name: cpu-nodes
+      min_nodes: 3  # For control plane HA
+      max_nodes: 10
+      machine_type:
+        aws: "m5.2xlarge"
+        gcp: "n1-standard-8"
+        azure: "Standard_D8s_v3"
+      cpu: 8
+      memory: "32GB"
+      disk: "100GB"
+      labels:
+        node-role: "cpu-worker"
+
+  # Storage Requirements
+  storage:
+    # For model artifacts, datasets, checkpoints
+    persistent_volumes:
+      - name: "ml-datasets"
+        size: "500GB"  # Adjust based on dataset size
+        storage_class: "fast-ssd"  # High IOPS for training data loading
+        access_mode: "ReadWriteMany"  # Multiple pods read datasets
+
+      - name: "model-registry"
+        size: "1TB"  # Store trained models
+        storage_class: "standard"
+        access_mode: "ReadWriteMany"
+
+      - name: "checkpoints"
+        size: "200GB"  # Training checkpoints
+        storage_class: "fast-ssd"
+        access_mode: "ReadWriteOnce"
+
+  # Network Requirements
+  network:
+    cni: "calico"  # Or Cilium, Weave
+    network_policies_enabled: true  # Required for multi-tenancy
+    service_mesh: "optional"  # Istio, Linkerd (optional)
+    bandwidth:
+      inter_node: "10Gbps+"  # For distributed training
+      internet: "1Gbps+"  # For model downloads, artifact push
+
+  # Add-ons Required
+  addons:
+    - name: "metrics-server"
+      required: true
+      purpose: "Pod autoscaling (KEDA dependency)"
+
+    - name: "nvidia-gpu-operator"
+      required: true
+      purpose: "GPU device plugin, DCGM exporter"
+      version: "v23.9.0+"
+
+    - name: "cert-manager"
+      required: true
+      purpose: "TLS certificates for webhooks (KServe, ArgoCD)"
+      version: "v1.13+"
+
+  # Resource Quotas (Recommended per namespace)
+  resource_quotas:
+    ml-training:
+      requests_nvidia_gpu: "8"  # Max 8 GPUs per training namespace
+      requests_cpu: "64"
+      requests_memory: "256Gi"
+      limits_nvidia_gpu: "8"
+      limits_cpu: "64"
+      limits_memory: "256Gi"
+
+    ml-serving:
+      requests_nvidia_gpu: "4"  # Max 4 GPUs for inference
+      requests_cpu: "32"
+      requests_memory: "128Gi"
+      limits_nvidia_gpu: "4"
+      limits_cpu: "32"
+      limits_memory: "128Gi"
+
+# Cloud Provider Specific Recommendations
+cloud_providers:
+  aws:
+    region: "us-west-2"  # Oregon (good GPU availability)
+    eks_version: "1.28+"
+    instance_types:
+      gpu_training: "p3.2xlarge"  # V100 16GB
+      gpu_inference: "g4dn.xlarge"  # T4 16GB (cost-effective)
+      gpu_llm_training: "p4d.24xlarge"  # A100 40GB x 8
+    storage_class: "gp3"  # General Purpose SSD
+    spot_instances: true  # 70% cost savings for training
+
+  gcp:
+    region: "us-central1"  # Iowa (good GPU availability)
+    gke_version: "1.28+"
+    instance_types:
+      gpu_training: "n1-standard-16-nvidia-tesla-v100"
+      gpu_inference: "n1-standard-4-nvidia-tesla-t4"
+      gpu_llm_training: "a2-highgpu-8g"  # A100 40GB x 8
+    storage_class: "pd-ssd"
+    preemptible_instances: true
+
+  azure:
+    region: "eastus"  # East US (good GPU availability)
+    aks_version: "1.28+"
+    instance_types:
+      gpu_training: "Standard_NC6s_v3"  # V100 16GB
+      gpu_inference: "Standard_NC4as_T4_v3"  # T4 16GB
+      gpu_llm_training: "Standard_ND96asr_v4"  # A100 40GB x 8
+    storage_class: "managed-premium"
+    spot_instances: true
+
+# Cost Estimates (Monthly, On-Demand Pricing)
+estimated_costs:
+  minimal_setup:
+    description: "2 GPU nodes (V100) + 3 CPU nodes"
+    gpu_nodes: "$1,800"  # 2 x p3.2xlarge x 730h x $3.06/h ≈ $4,468 (use spot for $900)
+    cpu_nodes: "$800"    # 3 x m5.2xlarge x 730h x $0.384/h ≈ $840
+    storage: "$150"      # 500GB SSD
+    networking: "$50"
+    total_ondemand: "$2,800/month"
+    total_spot: "$1,900/month"  # With spot instances for GPU nodes
+
+  production_setup:
+    description: "6 GPU nodes (A100) + 5 CPU nodes + HA"
+    gpu_nodes: "$21,900"  # 6 x p4d.24xlarge (A100 x 8)
+    cpu_nodes: "$1,400"
+    storage: "$500"
+    networking: "$200"
+    total_ondemand: "$24,000/month"
+    total_spot: "$12,000/month"  # With spot instances
+
+# Security Hardening Checklist
+security:
+  - name: "Enable Pod Security Standards"
+    level: "restricted"  # Enforced in production namespaces
+
+  - name: "Network Policies"
+    description: "Deny all ingress/egress by default, allow explicitly"
+
+  - name: "RBAC"
+    description: "Least privilege access, separate service accounts per component"
+
+  - name: "Secrets Encryption at Rest"
+    enabled: true
+
+  - name: "Audit Logging"
+    enabled: true
+    retention: "90 days"
+
+  - name: "Image Scanning"
+    tool: "Trivy, Harbor"
+    policy: "Block images with HIGH/CRITICAL CVEs"
+
+  - name: "Supply Chain Security"
+    - "Verify in-toto attestations"
+    - "Cosign signature verification"
+    - "SBOM generation (Syft)"
+
+# Disaster Recovery
+disaster_recovery:
+  backup:
+    - component: "etcd"
+      frequency: "daily"
+      retention: "30 days"
+
+    - component: "persistent-volumes"
+      frequency: "daily"
+      retention: "7 days"
+
+    - component: "model-registry"
+      frequency: "weekly"
+      retention: "90 days"
+      replication: "multi-region"
+
+  rto: "4 hours"  # Recovery Time Objective
+  rpo: "1 hour"   # Recovery Point Objective
+
+# Monitoring Thresholds
+monitoring:
+  alerts:
+    - name: "GPU utilization below 20% for 1 hour"
+      severity: "warning"
+      action: "Check for idle GPUs, consider scaling down"
+
+    - name: "GPU memory OOM events"
+      severity: "critical"
+      action: "Investigate training job resource limits"
+
+    - name: "Training job pending > 10 minutes"
+      severity: "warning"
+      action: "Check Volcano gang scheduling, GPU availability"
+
+    - name: "Daily GPU cost > $1000"
+      severity: "warning"
+      action: "Review OpenCost dashboard for runaway costs"

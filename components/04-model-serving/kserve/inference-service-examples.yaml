@@ -1,0 +1,547 @@
+# ABOUTME: KServe InferenceService examples for PyTorch, TensorFlow, ONNX, and Hugging Face models
+# ABOUTME: Demonstrates autoscaling, GPU allocation, model storage options, and custom serving runtimes
+
+---
+# Example 1: Simple PyTorch model from S3
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: pytorch-simple
+  namespace: ml-serving
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+
+---
+# Example 2: PyTorch model from Harbor OCI registry (using KitOps)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: pytorch-harbor
+  namespace: ml-serving
+  annotations:
+    # Enable autoscaling
+    autoscaling.knative.dev/minScale: "1"
+    autoscaling.knative.dev/maxScale: "10"
+    autoscaling.knative.dev/target: "100"  # Target 100 concurrent requests
+spec:
+  predictor:
+    serviceAccountName: kserve-sa  # Has Harbor credentials
+    pytorch:
+      # Pull model from Harbor registry
+      storageUri: oci://harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "1"  # Request 1 GPU
+      env:
+        - name: MODEL_NAME
+          value: "llama2-7b"
+        - name: MODEL_VERSION
+          value: "1.0.0"
+
+---
+# Example 3: TensorFlow model with GPU
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: tensorflow-gpu
+  namespace: ml-serving
+spec:
+  predictor:
+    tensorflow:
+      storageUri: s3://ml-models/tensorflow/bert-base
+      runtimeVersion: "2.13.0-gpu"
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "16Gi"
+          nvidia.com/gpu: "1"
+      nodeSelector:
+        accelerator: nvidia-tesla-t4  # Run on T4 GPU nodes
+
+---
+# Example 4: ONNX model with high concurrency
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: onnx-bert
+  namespace: ml-serving
+  annotations:
+    autoscaling.knative.dev/minScale: "2"  # Always keep 2 replicas warm
+    autoscaling.knative.dev/maxScale: "50"
+    autoscaling.knative.dev/target: "200"  # ONNX is fast, handle more concurrency
+spec:
+  predictor:
+    onnx:
+      storageUri: s3://ml-models/onnx/bert-base-uncased
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+
+---
+# Example 5: Hugging Face Transformers model
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: huggingface-gpt2
+  namespace: ml-serving
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: huggingface
+      storageUri: s3://ml-models/huggingface/gpt2
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+        limits:
+          cpu: "8"
+          memory: "16Gi"
+          nvidia.com/gpu: "1"
+      env:
+        - name: TASK
+          value: "text-generation"
+        - name: MAX_LENGTH
+          value: "100"
+
+---
+# Example 6: NVIDIA Triton for multi-framework serving
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: triton-ensemble
+  namespace: ml-serving
+spec:
+  predictor:
+    triton:
+      # Triton can serve multiple models simultaneously
+      storageUri: s3://ml-models/triton/model-repository
+      runtimeVersion: "23.10-py3"
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "1"
+      args:
+        - --model-repository=/mnt/models
+        - --model-control-mode=explicit
+        - --load-model=resnet50
+        - --load-model=bert-base
+
+---
+# Example 7: Custom Python server (for custom pre/post-processing)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: custom-python-server
+  namespace: ml-serving
+spec:
+  predictor:
+    containers:
+      - name: kserve-container
+        image: harbor.ml-platform.example.com/ml-models/custom-server:1.0.0
+        ports:
+          - containerPort: 8080
+            protocol: TCP
+        env:
+          - name: MODEL_NAME
+            value: "custom-model"
+          - name: STORAGE_URI
+            value: "s3://ml-models/custom/model.pkl"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+
+---
+# Example 8: Model with transformer (preprocessing) and explainer
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: model-with-transformer
+  namespace: ml-serving
+spec:
+  # Transformer: Preprocess requests before sending to predictor
+  transformer:
+    containers:
+      - name: transformer
+        image: harbor.ml-platform.example.com/ml-models/image-transformer:1.0.0
+        env:
+          - name: PROTOCOL
+            value: "v2"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+
+  # Predictor: Main model serving
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+
+  # Explainer: Model explainability (SHAP, Alibi)
+  explainer:
+    alibi:
+      type: AnchorImages
+      storageUri: s3://ml-models/explainers/resnet50-explainer
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+
+---
+# Example 9: Multi-model serving (ensemble)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: ensemble-model
+  namespace: ml-serving
+spec:
+  predictor:
+    containers:
+      - name: ensemble-server
+        image: harbor.ml-platform.example.com/ml-models/ensemble-server:1.0.0
+        env:
+          # Load multiple models
+          - name: MODEL_1_URI
+            value: "s3://ml-models/pytorch/resnet50"
+          - name: MODEL_2_URI
+            value: "s3://ml-models/tensorflow/efficientnet"
+          - name: MODEL_3_URI
+            value: "s3://ml-models/onnx/vit"
+          - name: ENSEMBLE_STRATEGY
+            value: "voting"  # Majority voting
+        resources:
+          requests:
+            cpu: "4"
+            memory: "16Gi"
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+            nvidia.com/gpu: "2"  # 2 GPUs for parallel inference
+
+---
+# Example 10: Model with PVC storage (shared across replicas)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: model-with-pvc
+  namespace: ml-serving
+spec:
+  predictor:
+    pytorch:
+      # Use PVC instead of S3 (faster cold starts)
+      storageUri: pvc://model-storage/llama2-70b
+      resources:
+        requests:
+          cpu: "8"
+          memory: "64Gi"
+        limits:
+          cpu: "16"
+          memory: "128Gi"
+          nvidia.com/gpu: "4"  # 4 GPUs for 70B model
+      volumeMounts:
+        - name: model-storage
+          mountPath: /mnt/models
+    volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: llama2-70b-pvc
+
+---
+# PVC for large model storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llama2-70b-pvc
+  namespace: ml-serving
+spec:
+  accessModes:
+    - ReadOnlyMany  # Multiple pods can read
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 200Gi  # 70B model is ~140GB
+
+---
+# Example 11: Model with scale-to-zero (cost optimization)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: scale-to-zero-model
+  namespace: ml-serving
+  annotations:
+    # Scale to zero after 60 seconds of inactivity
+    autoscaling.knative.dev/minScale: "0"
+    autoscaling.knative.dev/maxScale: "10"
+    autoscaling.knative.dev/scale-down-delay: "60s"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+
+---
+# Example 12: Model with custom metrics autoscaling
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: custom-metrics-autoscaling
+  namespace: ml-serving
+  annotations:
+    # Autoscale based on custom metric (GPU utilization)
+    autoscaling.knative.dev/class: "hpa.autoscaling.knative.dev"
+    autoscaling.knative.dev/metric: "gpu"
+    autoscaling.knative.dev/target: "70"  # Target 70% GPU utilization
+    autoscaling.knative.dev/minScale: "1"
+    autoscaling.knative.dev/maxScale: "20"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/llama2-13b
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "1"
+
+---
+# Example 13: Model with readiness/liveness probes
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: model-with-probes
+  namespace: ml-serving
+spec:
+  predictor:
+    containers:
+      - name: kserve-container
+        image: harbor.ml-platform.example.com/ml-models/pytorch-server:1.0.0
+        ports:
+          - containerPort: 8080
+            protocol: TCP
+        env:
+          - name: STORAGE_URI
+            value: "s3://ml-models/pytorch/resnet50"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+        # Readiness probe: Check if model is loaded
+        readinessProbe:
+          httpGet:
+            path: /v1/models/resnet50
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        # Liveness probe: Check if server is responsive
+        livenessProbe:
+          httpGet:
+            path: /v1/models/resnet50
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+
+---
+# Example 14: Model with resource quotas
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-serving-quota
+  namespace: ml-serving
+spec:
+  hard:
+    # Limit total GPU usage in namespace
+    requests.nvidia.com/gpu: "10"
+    limits.nvidia.com/gpu: "10"
+    # Limit total CPU/memory
+    requests.cpu: "100"
+    requests.memory: "500Gi"
+    limits.cpu: "200"
+    limits.memory: "1000Gi"
+    # Limit number of InferenceServices
+    count/inferenceservices.serving.kserve.io: "50"
+
+---
+# Example 15: Model with affinity (GPU node placement)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: model-with-affinity
+  namespace: ml-serving
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/llama2-7b
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "1"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # Only schedule on A100 GPU nodes
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+        podAntiAffinity:
+          # Spread replicas across different nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    serving.kserve.io/inferenceservice: model-with-affinity
+                topologyKey: kubernetes.io/hostname
+
+---
+# Testing InferenceServices
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-inference
+  namespace: ml-serving
+data:
+  test.sh: |
+    #!/bin/bash
+    # Test InferenceService
+
+    INFERENCE_SERVICE=$1
+    NAMESPACE=${2:-ml-serving}
+
+    if [ -z "$INFERENCE_SERVICE" ]; then
+      echo "Usage: $0 <inference-service-name> [namespace]"
+      exit 1
+    fi
+
+    # Get InferenceService URL
+    URL=$(kubectl get inferenceservice $INFERENCE_SERVICE -n $NAMESPACE \
+      -o jsonpath='{.status.url}')
+
+    echo "Testing InferenceService: $INFERENCE_SERVICE"
+    echo "URL: $URL"
+
+    # Test prediction endpoint (v1 protocol)
+    curl -H "Content-Type: application/json" \
+      $URL/v1/models/$INFERENCE_SERVICE:predict \
+      -d '{
+        "instances": [
+          [1.0, 2.0, 3.0, 4.0]
+        ]
+      }'
+
+    echo ""
+    echo "✓ Test complete"
+
+---
+# Best Practices Summary:
+#
+# 1. Resource Requests/Limits:
+#    - Always set CPU/memory requests (for scheduling)
+#    - Set limits to prevent resource starvation
+#    - GPU: Use limits (requests are ignored)
+#    - Start conservative, tune based on metrics
+#
+# 2. Autoscaling:
+#    - Set minScale > 0 for latency-critical models (avoid cold starts)
+#    - Set minScale = 0 for cost optimization (scale to zero)
+#    - Target concurrency based on model latency
+#    - Fast models (< 100ms): target 200-500 concurrency
+#    - Slow models (> 1s): target 10-50 concurrency
+#
+# 3. Storage:
+#    - S3: Good for most models, automatic retries
+#    - Harbor OCI: Best for KitOps models, versioned artifacts
+#    - PVC: Fastest cold starts, but requires pre-loading
+#    - HTTP: For public models (Hugging Face Hub)
+#
+# 4. GPU Allocation:
+#    - Use node selectors for specific GPU types
+#    - Consider GPU sharing (HAMi) for small models
+#    - Use affinity to spread replicas across nodes
+#    - Monitor GPU utilization, adjust replicas
+#
+# 5. Monitoring:
+#    - Enable Prometheus metrics (built into KServe)
+#    - Monitor: request rate, latency (p50, p99), error rate
+#    - Set up alerts for high error rate, slow response
+#    - Track cold start times
+#
+# Real-world impact:
+# - 0 to 100 replicas in 30 seconds
+# - Scale to zero saves 80% cost on idle models
+# - P99 latency < 500ms with proper autoscaling
+# - 99.9% availability with multiple replicas
+#
+# Common issues:
+# - Cold start latency: Use minScale > 0 or PVC storage
+# - OOM kills: Increase memory limits, reduce batch size
+# - Slow autoscaling: Reduce stable-window, increase target
+# - GPU OOM: Reduce model size, use quantization, or larger GPU
+#
+# Model size recommendations:
+# - < 1GB: CPU serving (cost-effective)
+# - 1-10GB: Single T4 GPU
+# - 10-50GB: Single A100 GPU
+# - 50-100GB: 2x A100 GPUs (with tensor parallelism)
+# - > 100GB: 4-8x A100 GPUs (with FSDP or DeepSpeed)

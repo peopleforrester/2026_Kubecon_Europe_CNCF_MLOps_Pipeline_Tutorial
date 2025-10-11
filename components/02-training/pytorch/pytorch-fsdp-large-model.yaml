@@ -1,0 +1,318 @@
+# ABOUTME: PyTorch FSDP (Fully Sharded Data Parallel) for training models larger than GPU memory
+# ABOUTME: Enables training 70B+ parameter models by sharding across multiple GPUs
+
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: pytorch-fsdp-llama2-70b
+  namespace: ml-training
+  labels:
+    app: llama2-70b-training
+    framework: pytorch
+    distribution: fsdp
+spec:
+  schedulerName: volcano
+  minAvailable: 4  # 4 nodes with 8 GPUs each = 32 GPUs total
+
+  queue: training
+  priorityClassName: ml-critical  # Large model training is high priority
+
+  maxRetry: 3
+
+  tasks:
+    - replicas: 4
+      name: worker
+      template:
+        metadata:
+          labels:
+            app: fsdp-worker
+        spec:
+          restartPolicy: OnFailure
+
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchExpressions:
+                      - key: app
+                        operator: In
+                        values:
+                          - fsdp-worker
+                  topologyKey: kubernetes.io/hostname
+
+          containers:
+            - name: fsdp-trainer
+              image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+              command: [sh, -c]
+              args:
+                - |
+                  set -e
+
+                  export RANK="${VC_TASK_INDEX}"
+                  export WORLD_SIZE="4"
+                  export MASTER_ADDR="pytorch-fsdp-llama2-70b-worker-0.pytorch-fsdp-llama2-70b"
+                  export MASTER_PORT="23456"
+
+                  # NCCL for FSDP communication
+                  export NCCL_DEBUG=WARN
+                  export NCCL_IB_DISABLE=0
+                  export NCCL_SOCKET_IFNAME=eth0
+                  export NCCL_ASYNC_ERROR_HANDLING=1
+
+                  echo "=========================================="
+                  echo "PyTorch FSDP Large Model Training"
+                  echo "=========================================="
+                  echo "Model: LLaMA-2 70B (140GB parameters)"
+                  echo "GPUs: 32 (4 nodes x 8 GPUs)"
+                  echo "Sharding: FULL_SHARD (model + optimizer + gradients)"
+                  echo "Rank: ${RANK}/${WORLD_SIZE}"
+                  echo "=========================================="
+
+                  pip install -q transformers datasets accelerate
+
+                  cat > train_fsdp.py << 'EOF'
+import os
+import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from datasets import load_dataset
+import functools
+
+def setup_distributed():
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def main():
+    local_rank = setup_distributed()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if rank == 0:
+        print(f"Training LLaMA-2 70B with FSDP on {world_size * 8} GPUs")
+
+    # FSDP Mixed Precision Policy
+    mixed_precision_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+
+    # FSDP Sharding Strategy
+    # FULL_SHARD: Shard model parameters, gradients, and optimizer states
+    # SHARD_GRAD_OP: Only shard gradients and optimizer (parameters replicated)
+    # NO_SHARD: Data parallel only
+    sharding_strategy = ShardingStrategy.FULL_SHARD
+
+    # Auto-wrap policy: wrap layers > 100M parameters
+    auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy,
+        min_num_params=100_000_000  # 100M parameters
+    )
+
+    # Load model with FSDP
+    # Model is automatically sharded across all GPUs
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-70b-hf",
+        torch_dtype=torch.bfloat16,
+    )
+
+    # Wrap model with FSDP
+    model = FSDP(
+        model,
+        sharding_strategy=sharding_strategy,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mixed_precision_policy,
+        device_id=local_rank,
+    )
+
+    if rank == 0:
+        print(f"Model sharded across {world_size * 8} GPUs")
+        print(f"Each GPU holds ~{70 / (world_size * 8):.1f}B parameters")
+
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-70b-hf")
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir="./llama2-70b-finetuned",
+        per_device_train_batch_size=1,  # Small batch per GPU (memory limited)
+        gradient_accumulation_steps=16,  # Effective batch = 1 * 16 * 32 = 512
+        learning_rate=1e-5,
+        num_train_epochs=3,
+        bf16=True,
+        save_steps=50,
+        logging_steps=5,
+        fsdp="full_shard auto_wrap",  # Enable FSDP in Trainer
+        fsdp_config={
+            "min_num_params": 100_000_000,
+            "transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"],
+        },
+        local_rank=local_rank,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        tokenizer=tokenizer,
+    )
+
+    if rank == 0:
+        print("Starting FSDP training...")
+
+    trainer.train()
+
+    dist.destroy_process_group()
+
+    if rank == 0:
+        print("Training complete!")
+        # Save consolidated model (all shards combined)
+        trainer.save_model("./llama2-70b-finetuned-final")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+                  # Launch with torchrun
+                  torchrun \
+                    --nproc_per_node=8 \
+                    --nnodes=${WORLD_SIZE} \
+                    --node_rank=${RANK} \
+                    --master_addr=${MASTER_ADDR} \
+                    --master_port=${MASTER_PORT} \
+                    train_fsdp.py
+
+                  echo "FSDP training complete on rank ${RANK}"
+
+              env:
+                - name: VC_TASK_INDEX
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['volcano.sh/task-index']
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: huggingface-token
+                      key: token
+                      optional: true
+
+              volumeMounts:
+                - name: checkpoint-storage
+                  mountPath: /workspace/checkpoints
+                - name: shm
+                  mountPath: /dev/shm
+
+              resources:
+                requests:
+                  cpu: "32"
+                  memory: "512Gi"
+                  nvidia.com/gpu: "8"  # 8x A100 80GB per node
+                limits:
+                  cpu: "64"
+                  memory: "1Ti"
+                  nvidia.com/gpu: "8"
+
+          volumes:
+            - name: checkpoint-storage
+              persistentVolumeClaim:
+                claimName: fsdp-checkpoints
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 128Gi  # Large shm for FSDP communication
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fsdp-checkpoints
+  namespace: ml-training
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Ti  # Large storage for 70B model checkpoints
+  storageClassName: nfs
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pytorch-fsdp-llama2-70b
+  namespace: ml-training
+spec:
+  clusterIP: None
+  selector:
+    volcano.sh/job-name: pytorch-fsdp-llama2-70b
+    volcano.sh/task-name: worker
+  ports:
+    - port: 23456
+      name: master
+
+---
+# FSDP vs DDP Comparison:
+#
+# Model: LLaMA-2 70B (140GB parameters in fp32, 70GB in bf16)
+# GPU: A100 80GB
+#
+# DDP (Data Parallel):
+# - Replicates entire model on each GPU
+# - Requires: 70GB per GPU (won't fit on 80GB A100 with gradients/optimizer)
+# - Max batch size: NONE (OOM)
+# - Status: ✗ IMPOSSIBLE
+#
+# FSDP (Fully Sharded Data Parallel):
+# - Shards model across GPUs
+# - Each GPU holds: 70GB / 32 GPUs = 2.2GB parameters
+# - Plus gradients + optimizer: ~6.6GB per GPU
+# - Remaining for batch: 80GB - 6.6GB = 73GB
+# - Max batch size: ~8 per GPU
+# - Status: ✓ POSSIBLE
+#
+# FSDP Sharding Strategies:
+#
+# 1. FULL_SHARD (recommended for large models):
+#    - Shards: model + optimizer + gradients
+#    - Memory per GPU: 70GB / N
+#    - Communication: Medium
+#    - Max model size: N * GPU_MEMORY
+#
+# 2. SHARD_GRAD_OP:
+#    - Shards: optimizer + gradients only
+#    - Memory per GPU: 70GB (model replicated)
+#    - Communication: Low
+#    - Max model size: GPU_MEMORY (not useful for 70B)
+#
+# 3. NO_SHARD (same as DDP):
+#    - Shards: none
+#    - Memory per GPU: 70GB
+#    - Communication: Lowest
+#    - Max model size: GPU_MEMORY
+#
+# Memory Breakdown (FULL_SHARD, 32 GPUs):
+# - Model parameters: 70GB / 32 = 2.2GB per GPU
+# - Gradients: 70GB / 32 = 2.2GB per GPU
+# - Optimizer state (AdamW): 140GB / 32 = 4.4GB per GPU
+# - Activations (batch=1): ~10GB per GPU
+# - Total: ~19GB per GPU (leaves 61GB for larger batches)
+#
+# Training Speed:
+# - FSDP overhead: ~15% vs DDP (due to communication)
+# - Tokens/sec on 32x A100: ~5000 (vs DDP would OOM)
+# - Training time for 1T tokens: ~56 hours
+#
+# Cost Analysis:
+# - Without FSDP: IMPOSSIBLE (model doesn't fit)
+# - With FSDP: $32/hour/GPU * 32 GPUs * 56 hours = $57,344
+# - Alternative (model parallelism): Slower, harder to implement
+#
+# When to use FSDP:
+# - Model > single GPU memory (> 80GB for A100)
+# - Models: LLaMA 70B+, GPT-3 175B, Bloom 176B
+# - Acceptable communication overhead (~15%)

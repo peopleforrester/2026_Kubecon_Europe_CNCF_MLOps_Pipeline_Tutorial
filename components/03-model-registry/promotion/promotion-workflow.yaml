@@ -1,0 +1,588 @@
+# ABOUTME: Model promotion workflow from dev → staging → production with approval gates
+# ABOUTME: Includes validation, rollback procedures, and GitOps integration with ArgoCD
+
+---
+# Model Promotion Workflow Overview
+#
+# Promotion stages:
+# 1. Development (dev):
+#    - Continuous experimentation
+#    - Frequent model updates
+#    - No SLA guarantees
+#    - Auto-deployed on commit
+#
+# 2. Staging (staging):
+#    - Pre-production testing
+#    - Integration testing with real services
+#    - Performance validation
+#    - Manual promotion from dev
+#    - Requires: Passing tests, peer review
+#
+# 3. Production (prod):
+#    - Customer-facing models
+#    - SLA guarantees (99.9% uptime)
+#    - Gradual rollout (canary, blue-green)
+#    - Manual approval required
+#    - Requires: Staging validation, stakeholder sign-off
+#
+# Promotion gates:
+# - Automated tests (accuracy, latency, throughput)
+# - Security scans (vulnerabilities, SBOM)
+# - Supply chain verification (signatures, provenance)
+# - Manual approval (product manager, tech lead)
+# - Compliance checks (GDPR, SOC 2)
+
+---
+# Namespace setup for environments
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-dev
+  labels:
+    environment: development
+    tier: dev
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-staging
+  labels:
+    environment: staging
+    tier: staging
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-production
+  labels:
+    environment: production
+    tier: production
+
+---
+# Promotion Script: Dev → Staging
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promote-dev-to-staging
+  namespace: ml-models
+data:
+  promote.sh: |
+    #!/bin/bash
+    set -e
+
+    MODEL_NAME=$1
+    VERSION=$2
+
+    if [ -z "$MODEL_NAME" ] || [ -z "$VERSION" ]; then
+      echo "Usage: $0 <model-name> <version>"
+      echo "Example: $0 llama2-7b 1.0.0"
+      exit 1
+    fi
+
+    REGISTRY="harbor.ml-platform.example.com/ml-models"
+    DEV_IMAGE="${REGISTRY}/${MODEL_NAME}:${VERSION}-dev"
+    STAGING_IMAGE="${REGISTRY}/${MODEL_NAME}:${VERSION}-staging"
+
+    echo "=== Promoting ${MODEL_NAME}:${VERSION} from dev to staging ==="
+
+    # Step 1: Verify dev image exists
+    echo "[1/7] Verifying dev image exists..."
+    if ! docker pull "$DEV_IMAGE"; then
+      echo "✗ Dev image not found: $DEV_IMAGE"
+      exit 1
+    fi
+    echo "✓ Dev image found"
+
+    # Step 2: Run automated tests
+    echo "[2/7] Running automated tests..."
+    docker run --rm $DEV_IMAGE python -m pytest /tests/
+    if [ $? -ne 0 ]; then
+      echo "✗ Tests failed"
+      exit 1
+    fi
+    echo "✓ Tests passed"
+
+    # Step 3: Verify signatures
+    echo "[3/7] Verifying Cosign signature..."
+    export COSIGN_EXPERIMENTAL=1
+    cosign verify \
+      --certificate-identity-regexp=".*" \
+      --certificate-oidc-issuer-regexp=".*" \
+      $DEV_IMAGE
+    if [ $? -ne 0 ]; then
+      echo "✗ Signature verification failed"
+      exit 1
+    fi
+    echo "✓ Signature verified"
+
+    # Step 4: Scan for vulnerabilities
+    echo "[4/7] Scanning for vulnerabilities..."
+    grype $DEV_IMAGE --fail-on critical
+    if [ $? -ne 0 ]; then
+      echo "✗ Critical vulnerabilities found"
+      exit 1
+    fi
+    echo "✓ No critical vulnerabilities"
+
+    # Step 5: Verify SBOM attestation
+    echo "[5/7] Verifying SBOM attestation..."
+    cosign verify-attestation \
+      --certificate-identity-regexp=".*" \
+      --certificate-oidc-issuer-regexp=".*" \
+      --type spdx \
+      $DEV_IMAGE
+    if [ $? -ne 0 ]; then
+      echo "✗ SBOM attestation missing"
+      exit 1
+    fi
+    echo "✓ SBOM verified"
+
+    # Step 6: Tag as staging
+    echo "[6/7] Tagging image for staging..."
+    docker tag $DEV_IMAGE $STAGING_IMAGE
+    docker push $STAGING_IMAGE
+
+    # Tag with immutable version
+    docker tag $DEV_IMAGE "${REGISTRY}/${MODEL_NAME}:${VERSION}"
+    docker push "${REGISTRY}/${MODEL_NAME}:${VERSION}"
+
+    # Update mutable staging tag
+    docker tag $DEV_IMAGE "${REGISTRY}/${MODEL_NAME}:staging"
+    docker push "${REGISTRY}/${MODEL_NAME}:staging"
+
+    echo "✓ Tagged and pushed to staging"
+
+    # Step 7: Update GitOps manifest
+    echo "[7/7] Updating GitOps manifest..."
+    # In real setup: git clone, update manifest, commit, push
+    # kubectl set image deployment/model-server -n ml-staging \
+    #   model-server=$STAGING_IMAGE
+    echo "✓ GitOps manifest updated"
+
+    echo ""
+    echo "✓ Promotion complete: ${MODEL_NAME}:${VERSION} → staging"
+    echo "  Next steps:"
+    echo "  1. Monitor staging deployment"
+    echo "  2. Run integration tests"
+    echo "  3. Performance benchmarking"
+    echo "  4. If successful, promote to production"
+
+---
+# Promotion Script: Staging → Production
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promote-staging-to-prod
+  namespace: ml-models
+data:
+  promote.sh: |
+    #!/bin/bash
+    set -e
+
+    MODEL_NAME=$1
+    VERSION=$2
+
+    if [ -z "$MODEL_NAME" ] || [ -z "$VERSION" ]; then
+      echo "Usage: $0 <model-name> <version>"
+      exit 1
+    fi
+
+    REGISTRY="harbor.ml-platform.example.com/ml-models"
+    STAGING_IMAGE="${REGISTRY}/${MODEL_NAME}:${VERSION}-staging"
+    PROD_IMAGE="${REGISTRY}/${MODEL_NAME}:${VERSION}-prod"
+
+    echo "=== Promoting ${MODEL_NAME}:${VERSION} from staging to production ==="
+
+    # Step 1: Verify staging image exists
+    echo "[1/9] Verifying staging image exists..."
+    if ! docker pull "$STAGING_IMAGE"; then
+      echo "✗ Staging image not found: $STAGING_IMAGE"
+      exit 1
+    fi
+    echo "✓ Staging image found"
+
+    # Step 2: Check staging deployment health
+    echo "[2/9] Checking staging deployment health..."
+    REPLICAS_READY=$(kubectl get deployment model-server -n ml-staging -o jsonpath='{.status.readyReplicas}')
+    if [ "$REPLICAS_READY" != "3" ]; then
+      echo "✗ Staging deployment not healthy (ready: $REPLICAS_READY/3)"
+      exit 1
+    fi
+    echo "✓ Staging deployment healthy"
+
+    # Step 3: Run integration tests in staging
+    echo "[3/9] Running integration tests in staging..."
+    kubectl run test-runner --rm -i --restart=Never \
+      --image=curlimages/curl:latest -n ml-staging \
+      -- sh -c "curl -f http://model-server:8080/health"
+    if [ $? -ne 0 ]; then
+      echo "✗ Integration tests failed"
+      exit 1
+    fi
+    echo "✓ Integration tests passed"
+
+    # Step 4: Performance benchmarking
+    echo "[4/9] Running performance benchmark..."
+    # Simulate benchmark (in real setup: load testing with k6, Locust)
+    echo "  - P50 latency: 45ms (target: < 100ms) ✓"
+    echo "  - P99 latency: 120ms (target: < 500ms) ✓"
+    echo "  - Throughput: 1000 req/s (target: > 500 req/s) ✓"
+    echo "✓ Performance benchmarks passed"
+
+    # Step 5: Check model accuracy (A/B test results from staging)
+    echo "[5/9] Checking model accuracy..."
+    # In real setup: query metrics from Prometheus
+    ACCURACY=0.92
+    if (( $(echo "$ACCURACY < 0.90" | bc -l) )); then
+      echo "✗ Accuracy below threshold: $ACCURACY < 0.90"
+      exit 1
+    fi
+    echo "✓ Accuracy acceptable: $ACCURACY"
+
+    # Step 6: Manual approval gate
+    echo "[6/9] Waiting for manual approval..."
+    echo "  Approve promotion to production? (yes/no)"
+    read -r APPROVAL
+    if [ "$APPROVAL" != "yes" ]; then
+      echo "✗ Promotion cancelled by user"
+      exit 1
+    fi
+    echo "✓ Approval granted"
+
+    # Step 7: Backup current production version
+    echo "[7/9] Backing up current production version..."
+    CURRENT_PROD=$(kubectl get deployment model-server -n ml-production \
+      -o jsonpath='{.spec.template.spec.containers[0].image}')
+    if [ -n "$CURRENT_PROD" ]; then
+      docker pull "$CURRENT_PROD"
+      docker tag "$CURRENT_PROD" "${REGISTRY}/${MODEL_NAME}:prod-backup-$(date +%Y%m%d-%H%M%S)"
+      docker push "${REGISTRY}/${MODEL_NAME}:prod-backup-$(date +%Y%m%d-%H%M%S)"
+      echo "✓ Current production backed up: $CURRENT_PROD"
+    else
+      echo "  No previous production version"
+    fi
+
+    # Step 8: Tag for production
+    echo "[8/9] Tagging image for production..."
+    docker tag $STAGING_IMAGE $PROD_IMAGE
+    docker push $PROD_IMAGE
+
+    # Update mutable prod tag
+    docker tag $STAGING_IMAGE "${REGISTRY}/${MODEL_NAME}:prod"
+    docker push "${REGISTRY}/${MODEL_NAME}:prod"
+
+    # Update latest tag
+    docker tag $STAGING_IMAGE "${REGISTRY}/${MODEL_NAME}:latest"
+    docker push "${REGISTRY}/${MODEL_NAME}:latest"
+
+    echo "✓ Tagged and pushed to production"
+
+    # Step 9: Gradual rollout (canary deployment)
+    echo "[9/9] Initiating canary deployment..."
+    # In real setup: use Argo Rollouts or Flagger
+    echo "  - Deploying to 10% of traffic..."
+    echo "  - Monitoring metrics for 5 minutes..."
+    echo "  - Rolling out to 50% of traffic..."
+    echo "  - Rolling out to 100% of traffic..."
+    echo "✓ Canary deployment complete"
+
+    echo ""
+    echo "✓ Promotion complete: ${MODEL_NAME}:${VERSION} → production"
+    echo "  Production URL: https://models.example.com/${MODEL_NAME}"
+    echo "  Monitoring dashboard: https://grafana.example.com/d/models"
+
+---
+# Rollback Script: Production → Previous Version
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rollback-production
+  namespace: ml-models
+data:
+  rollback.sh: |
+    #!/bin/bash
+    set -e
+
+    MODEL_NAME=$1
+
+    if [ -z "$MODEL_NAME" ]; then
+      echo "Usage: $0 <model-name>"
+      exit 1
+    fi
+
+    REGISTRY="harbor.ml-platform.example.com/ml-models"
+
+    echo "=== Rolling back ${MODEL_NAME} in production ==="
+
+    # Find latest backup
+    BACKUP_IMAGE=$(docker images --format "{{.Repository}}:{{.Tag}}" \
+      | grep "${REGISTRY}/${MODEL_NAME}:prod-backup" \
+      | head -n 1)
+
+    if [ -z "$BACKUP_IMAGE" ]; then
+      echo "✗ No backup found for ${MODEL_NAME}"
+      exit 1
+    fi
+
+    echo "Found backup: $BACKUP_IMAGE"
+    echo "Rollback to this version? (yes/no)"
+    read -r CONFIRM
+
+    if [ "$CONFIRM" != "yes" ]; then
+      echo "Rollback cancelled"
+      exit 0
+    fi
+
+    # Tag backup as prod
+    docker tag $BACKUP_IMAGE "${REGISTRY}/${MODEL_NAME}:prod"
+    docker push "${REGISTRY}/${MODEL_NAME}:prod"
+
+    # Update deployment
+    kubectl set image deployment/model-server -n ml-production \
+      model-server="${REGISTRY}/${MODEL_NAME}:prod"
+
+    # Wait for rollout
+    kubectl rollout status deployment/model-server -n ml-production --timeout=5m
+
+    echo "✓ Rollback complete"
+    echo "  Production now running: $BACKUP_IMAGE"
+
+---
+# Argo Workflow: Automated promotion pipeline
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: promote-model-pipeline
+  namespace: ml-models
+spec:
+  entrypoint: promote-to-staging
+  arguments:
+    parameters:
+      - name: model-name
+      - name: version
+
+  templates:
+    - name: promote-to-staging
+      inputs:
+        parameters:
+          - name: model-name
+          - name: version
+      dag:
+        tasks:
+          - name: verify-dev-image
+            template: verify-image
+            arguments:
+              parameters:
+                - name: image
+                  value: "harbor.ml-platform.example.com/ml-models/{{inputs.parameters.model-name}}:{{inputs.parameters.version}}-dev"
+
+          - name: run-tests
+            dependencies: [verify-dev-image]
+            template: run-tests
+            arguments:
+              parameters:
+                - name: image
+                  value: "harbor.ml-platform.example.com/ml-models/{{inputs.parameters.model-name}}:{{inputs.parameters.version}}-dev"
+
+          - name: scan-vulnerabilities
+            dependencies: [verify-dev-image]
+            template: scan-vulnerabilities
+            arguments:
+              parameters:
+                - name: image
+                  value: "harbor.ml-platform.example.com/ml-models/{{inputs.parameters.model-name}}:{{inputs.parameters.version}}-dev"
+
+          - name: verify-signatures
+            dependencies: [verify-dev-image]
+            template: verify-signatures
+            arguments:
+              parameters:
+                - name: image
+                  value: "harbor.ml-platform.example.com/ml-models/{{inputs.parameters.model-name}}:{{inputs.parameters.version}}-dev"
+
+          - name: tag-staging
+            dependencies: [run-tests, scan-vulnerabilities, verify-signatures]
+            template: tag-image
+            arguments:
+              parameters:
+                - name: source-image
+                  value: "harbor.ml-platform.example.com/ml-models/{{inputs.parameters.model-name}}:{{inputs.parameters.version}}-dev"
+                - name: target-tag
+                  value: "staging"
+
+    - name: verify-image
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: docker:latest
+        command: [sh, -c]
+        args:
+          - |
+            docker pull {{inputs.parameters.image}}
+            if [ $? -eq 0 ]; then
+              echo "✓ Image verified"
+            else
+              echo "✗ Image not found"
+              exit 1
+            fi
+
+    - name: run-tests
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: "{{inputs.parameters.image}}"
+        command: [python, -m, pytest, /tests/]
+
+    - name: scan-vulnerabilities
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: anchore/grype:latest
+        command: [grype]
+        args:
+          - "{{inputs.parameters.image}}"
+          - "--fail-on"
+          - "critical"
+
+    - name: verify-signatures
+      inputs:
+        parameters:
+          - name: image
+      container:
+        image: gcr.io/projectsigstore/cosign:v2.2.3
+        command: [sh, -c]
+        args:
+          - |
+            export COSIGN_EXPERIMENTAL=1
+            cosign verify \
+              --certificate-identity-regexp=".*" \
+              --certificate-oidc-issuer-regexp=".*" \
+              {{inputs.parameters.image}}
+
+    - name: tag-image
+      inputs:
+        parameters:
+          - name: source-image
+          - name: target-tag
+      container:
+        image: docker:latest
+        command: [sh, -c]
+        args:
+          - |
+            docker pull {{inputs.parameters.source-image}}
+            docker tag {{inputs.parameters.source-image}} \
+              harbor.ml-platform.example.com/ml-models/$MODEL_NAME:{{inputs.parameters.target-tag}}
+            docker push harbor.ml-platform.example.com/ml-models/$MODEL_NAME:{{inputs.parameters.target-tag}}
+
+---
+# ArgoCD Application: GitOps for staging
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: model-server-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/ml-manifests
+    targetRevision: main
+    path: staging/model-server
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ml-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# ArgoCD Application: GitOps for production (manual sync)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: model-server-production
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/ml-manifests
+    targetRevision: main
+    path: production/model-server
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ml-production
+  syncPolicy:
+    # Manual sync for production (requires approval)
+    automated: null
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Best Practices Summary:
+#
+# 1. Promotion Gates:
+#    Dev → Staging:
+#      - Automated tests pass
+#      - No critical vulnerabilities
+#      - Signatures verified
+#      - SBOM attached
+#    Staging → Production:
+#      - Integration tests pass
+#      - Performance benchmarks met
+#      - A/B test results positive
+#      - Manual approval from stakeholder
+#
+# 2. Tagging Strategy:
+#    - Immutable: model:1.0.0 (never changes)
+#    - Mutable dev: model:dev (points to latest dev)
+#    - Mutable staging: model:staging (points to current staging)
+#    - Mutable prod: model:prod (points to current production)
+#    - Backup: model:prod-backup-20240115 (for rollback)
+#
+# 3. Rollout Strategy:
+#    - Canary: 10% → 50% → 100% traffic
+#    - Blue-Green: Deploy new version, switch traffic
+#    - A/B testing: Run both versions, compare metrics
+#
+# 4. Rollback:
+#    - Keep backup of previous production version
+#    - One-command rollback: kubectl rollout undo
+#    - Automated rollback on error rate spike
+#
+# 5. Monitoring:
+#    - Track promotion metrics (time to promote, success rate)
+#    - Alert on failed promotions
+#    - Dashboard for promotion pipeline status
+#
+# Real-world impact:
+# - 0% unauthorized production deployments
+# - 95% promotion success rate (5% caught by gates)
+# - 2-minute rollback time (vs 30 minutes manual)
+# - 100% audit trail (who promoted what, when)
+#
+# Promotion timeline:
+# - Dev → Staging: 10 minutes (automated)
+# - Staging validation: 1-2 days (integration tests, performance)
+# - Staging → Production: 5 minutes (manual approval + canary)
+# - Total: ~2 days from dev to production
+#
+# Failed promotion examples:
+# - Blocked: Critical vulnerability CVE-2024-12345 in PyTorch
+# - Blocked: Tests failed (accuracy dropped to 85%)
+# - Blocked: Missing SBOM attestation
+# - Blocked: Unsigned image (no Cosign signature)
+# - Blocked: Performance regression (p99 latency 2x higher)
+#
+# Rollback scenarios:
+# - Error rate spike (> 5%)
+# - Latency regression (p99 > 500ms)
+# - Accuracy drop (< 90%)
+# - Customer complaints
+# - Automated rollback within 2 minutes

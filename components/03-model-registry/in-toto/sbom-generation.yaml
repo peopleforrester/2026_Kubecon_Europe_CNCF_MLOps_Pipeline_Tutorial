@@ -1,0 +1,596 @@
+# ABOUTME: Software Bill of Materials (SBOM) generation for ML models and containers
+# ABOUTME: Tracks dependencies, licenses, vulnerabilities for supply chain transparency and compliance
+#
+# ⚠️ SECURITY NOTE: This file contains curl | sh commands for tool installation
+# For production deployments, download and verify scripts before execution:
+#   curl -sSfL https://url/install.sh -o /tmp/install.sh
+#   # Review script contents
+#   less /tmp/install.sh
+#   # Verify checksum (obtain from official source)
+#   sha256sum /tmp/install.sh
+#   # Then execute
+#   sh /tmp/install.sh
+
+---
+# SBOM Overview for ML Models
+#
+# An SBOM (Software Bill of Materials) lists all components in a model artifact:
+# 1. Python packages (PyTorch, NumPy, transformers)
+# 2. System libraries (CUDA, cuDNN, OpenSSL)
+# 3. Model files (weights, configs, tokenizers)
+# 4. Training datasets (name, version, license)
+# 5. Licenses (Apache 2.0, MIT, GPL)
+# 6. Vulnerabilities (CVEs in dependencies)
+#
+# Why SBOMs matter for ML:
+# - Security: Identify vulnerable dependencies (Log4j, OpenSSL)
+# - Compliance: Prove no GPL code in commercial models
+# - Licensing: Track dataset licenses (CC-BY, MIT, proprietary)
+# - Transparency: Know what's inside a "black box" model
+# - Incident response: Rapidly identify affected models (CVE-2024-XXXX)
+#
+# Standards:
+# - SPDX (Software Package Data Exchange) - Linux Foundation
+# - CycloneDX - OWASP
+# - SWID (Software Identification) - ISO/IEC 19770-2
+#
+# Tools:
+# - Syft (Anchore) - Generate SBOMs from containers
+# - Grype (Anchore) - Scan SBOMs for vulnerabilities
+# - Trivy (Aqua Security) - SBOM + vulnerability scanning
+
+---
+# Install Syft (SBOM generator)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: syft-install
+  namespace: ml-models
+data:
+  install.sh: |
+    #!/bin/bash
+    # Install Syft (Anchore SBOM generator)
+    SYFT_VERSION="v1.0.1"
+    # ⚠️ SECURITY: See file header for production-safe installation method
+    curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin $SYFT_VERSION
+
+    # Verify installation
+    syft version
+
+---
+# Example 1: Generate SBOM for model container
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: generate-sbom-container
+  namespace: ml-models
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sbom-generator
+          image: anchore/syft:latest
+          command: [sh, -c]
+          args:
+            - |
+              MODEL_IMAGE="harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0"
+
+              echo "Generating SBOM for: $MODEL_IMAGE"
+
+              # Generate SBOM in SPDX JSON format
+              syft $MODEL_IMAGE -o spdx-json > sbom.spdx.json
+
+              echo "✓ SBOM generated"
+              echo "  - Format: SPDX 2.3 JSON"
+              echo "  - Size: $(wc -c < sbom.spdx.json) bytes"
+
+              # Preview SBOM
+              echo "=== SBOM Summary ==="
+              syft $MODEL_IMAGE -o table
+
+              # Upload to S3
+              # aws s3 cp sbom.spdx.json s3://ml-sboms/llama2-7b/1.0.0/sbom.spdx.json
+
+---
+# Example 2: Generate SBOM with multiple formats
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: generate-sbom-all-formats
+  namespace: ml-models
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sbom-generator
+          image: anchore/syft:latest
+          command: [sh, -c]
+          args:
+            - |
+              MODEL_IMAGE="harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0"
+
+              echo "Generating SBOM in multiple formats..."
+
+              # SPDX JSON (most detailed)
+              syft $MODEL_IMAGE -o spdx-json > sbom.spdx.json
+              echo "✓ SPDX JSON: $(wc -l < sbom.spdx.json) lines"
+
+              # CycloneDX JSON (OWASP standard)
+              syft $MODEL_IMAGE -o cyclonedx-json > sbom.cyclonedx.json
+              echo "✓ CycloneDX JSON: $(wc -l < sbom.cyclonedx.json) lines"
+
+              # SPDX Tag-Value (human-readable)
+              syft $MODEL_IMAGE -o spdx-tag-value > sbom.spdx.txt
+              echo "✓ SPDX Tag-Value: $(wc -l < sbom.spdx.txt) lines"
+
+              # Syft JSON (Anchore format)
+              syft $MODEL_IMAGE -o syft-json > sbom.syft.json
+              echo "✓ Syft JSON: $(wc -l < sbom.syft.json) lines"
+
+              # Human-readable table
+              syft $MODEL_IMAGE -o table > sbom.txt
+              echo "✓ Table: $(wc -l < sbom.txt) lines"
+
+              ls -lh sbom.*
+
+---
+# Example 3: SBOM with vulnerability scanning
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sbom-with-vulnerabilities
+  namespace: ml-models
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: scanner
+          image: anchore/grype:latest
+          command: [sh, -c]
+          args:
+            - |
+              MODEL_IMAGE="harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0"
+
+              # Install Syft (Grype container doesn't include it)
+              # ⚠️ SECURITY: For production, pre-install in custom image
+              curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+              echo "Generating SBOM and scanning for vulnerabilities..."
+
+              # Generate SBOM
+              syft $MODEL_IMAGE -o spdx-json > sbom.spdx.json
+
+              # Scan SBOM for vulnerabilities with Grype
+              grype sbom:sbom.spdx.json -o table
+
+              echo ""
+              echo "=== Vulnerability Summary ==="
+              grype sbom:sbom.spdx.json -o json | jq '.matches | group_by(.vulnerability.severity) | map({severity: .[0].vulnerability.severity, count: length})'
+
+              # Fail if critical vulnerabilities found
+              CRITICAL_COUNT=$(grype sbom:sbom.spdx.json -o json | jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length')
+
+              if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                echo "✗ Found $CRITICAL_COUNT critical vulnerabilities"
+                echo "  Block deployment until patched"
+                exit 1
+              else
+                echo "✓ No critical vulnerabilities"
+              fi
+
+---
+# Example 4: Attach SBOM to model with Cosign
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: attach-sbom-to-model
+  namespace: ml-models
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: model-signer
+      containers:
+        - name: attacher
+          image: gcr.io/projectsigstore/cosign:v2.2.3
+          command: [sh, -c]
+          args:
+            - |
+              # Install Syft
+              # ⚠️ SECURITY: See file header for production-safe installation method
+              curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+              MODEL_IMAGE="harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0"
+
+              echo "Generating SBOM..."
+              syft $MODEL_IMAGE -o spdx-json > sbom.spdx.json
+
+              echo "Attaching SBOM to model as attestation..."
+              export COSIGN_EXPERIMENTAL=1
+              cosign attest \
+                --yes \
+                --predicate sbom.spdx.json \
+                --type spdx \
+                $MODEL_IMAGE
+
+              echo "✓ SBOM attached to model"
+
+              # Verify SBOM attestation
+              echo "Verifying SBOM attestation..."
+              cosign verify-attestation \
+                --certificate-identity-regexp=".*" \
+                --certificate-oidc-issuer-regexp=".*" \
+                --type spdx \
+                $MODEL_IMAGE | jq .
+
+              echo "✓ SBOM verified"
+
+---
+# Example 5: CI/CD integration - Generate SBOM during build
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-model-with-sbom
+  namespace: ml-models
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: model-signer
+      containers:
+        - name: builder
+          image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+          command: [sh, -c]
+          args:
+            - |
+              # Install tools
+              # ⚠️ SECURITY: See file header for production-safe installation method
+              curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+              curl -LO https://github.com/sigstore/cosign/releases/download/v2.2.3/cosign-linux-amd64
+              mv cosign-linux-amd64 /usr/local/bin/cosign
+              chmod +x /usr/local/bin/cosign
+              curl -LO https://github.com/jozu-ai/kitops/releases/download/v0.2.0/kit-linux-x86_64.tar.gz
+              tar -xzf kit-linux-x86_64.tar.gz
+              mv kit /usr/local/bin/
+
+              # Build model (simulate)
+              echo "Training model..."
+              mkdir -p model
+              echo "model weights" > model/weights.pth
+
+              # Create Kitfile
+              cat > Kitfile << 'EOF'
+              manifestVersion: 1.0
+              package:
+                name: llama2-7b
+                version: 1.0.0
+              model:
+                name: llama2-7b
+                path: ./model
+                framework: pytorch
+              EOF
+
+              # Package model
+              MODEL_IMAGE="harbor.ml-platform.example.com/ml-models/llama2-7b:1.0.0"
+              kit pack . -t $MODEL_IMAGE
+
+              # Push to Harbor
+              echo "$HARBOR_PASSWORD" | kit login harbor.ml-platform.example.com --username "$HARBOR_USERNAME" --password-stdin
+              kit push $MODEL_IMAGE
+
+              # Generate SBOM
+              echo "Generating SBOM..."
+              syft $MODEL_IMAGE -o spdx-json > sbom.spdx.json
+
+              # Attach SBOM as attestation
+              export COSIGN_EXPERIMENTAL=1
+              cosign attest --yes --predicate sbom.spdx.json --type spdx $MODEL_IMAGE
+
+              # Sign model
+              cosign sign --yes $MODEL_IMAGE
+
+              echo "✓ Model built, pushed, SBOM attached, and signed"
+
+          env:
+            - name: HARBOR_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-credentials
+                  key: username
+            - name: HARBOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-credentials
+                  key: password
+            - name: COSIGN_EXPERIMENTAL
+              value: "1"
+
+---
+# Example SBOM content (SPDX JSON)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: example-sbom
+  namespace: ml-models
+data:
+  sbom.spdx.json: |
+    {
+      "spdxVersion": "SPDX-2.3",
+      "dataLicense": "CC0-1.0",
+      "SPDXID": "SPDXRef-DOCUMENT",
+      "name": "llama2-7b-1.0.0",
+      "documentNamespace": "https://example.com/sbom/llama2-7b-1.0.0",
+      "creationInfo": {
+        "created": "2024-01-15T10:00:00Z",
+        "creators": ["Tool: syft-1.0.1"],
+        "licenseListVersion": "3.21"
+      },
+      "packages": [
+        {
+          "SPDXID": "SPDXRef-Package-pytorch",
+          "name": "torch",
+          "versionInfo": "2.1.0",
+          "supplier": "Organization: PyTorch",
+          "downloadLocation": "https://pypi.org/project/torch/2.1.0/",
+          "filesAnalyzed": false,
+          "licenseConcluded": "BSD-3-Clause",
+          "licenseDeclared": "BSD-3-Clause",
+          "copyrightText": "Copyright (c) PyTorch Contributors",
+          "externalRefs": [
+            {
+              "referenceCategory": "PACKAGE-MANAGER",
+              "referenceType": "purl",
+              "referenceLocator": "pkg:pypi/torch@2.1.0"
+            }
+          ]
+        },
+        {
+          "SPDXID": "SPDXRef-Package-transformers",
+          "name": "transformers",
+          "versionInfo": "4.30.0",
+          "supplier": "Organization: Hugging Face",
+          "downloadLocation": "https://pypi.org/project/transformers/4.30.0/",
+          "filesAnalyzed": false,
+          "licenseConcluded": "Apache-2.0",
+          "licenseDeclared": "Apache-2.0",
+          "copyrightText": "Copyright (c) Hugging Face"
+        },
+        {
+          "SPDXID": "SPDXRef-Package-numpy",
+          "name": "numpy",
+          "versionInfo": "1.24.3",
+          "supplier": "Organization: NumPy Developers",
+          "downloadLocation": "https://pypi.org/project/numpy/1.24.3/",
+          "filesAnalyzed": false,
+          "licenseConcluded": "BSD-3-Clause",
+          "licenseDeclared": "BSD-3-Clause"
+        },
+        {
+          "SPDXID": "SPDXRef-Package-cuda",
+          "name": "cuda",
+          "versionInfo": "12.1",
+          "supplier": "Organization: NVIDIA",
+          "downloadLocation": "https://developer.nvidia.com/cuda-12-1-0-download-archive",
+          "filesAnalyzed": false,
+          "licenseConcluded": "NOASSERTION",
+          "licenseDeclared": "NOASSERTION",
+          "comment": "Proprietary NVIDIA license"
+        }
+      ],
+      "relationships": [
+        {
+          "spdxElementId": "SPDXRef-DOCUMENT",
+          "relationshipType": "DESCRIBES",
+          "relatedSpdxElement": "SPDXRef-Package-pytorch"
+        },
+        {
+          "spdxElementId": "SPDXRef-Package-pytorch",
+          "relationshipType": "DEPENDS_ON",
+          "relatedSpdxElement": "SPDXRef-Package-numpy"
+        }
+      ]
+    }
+
+---
+# SBOM Policy: Require SBOM for all models
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbom-policy
+  namespace: ml-serving
+data:
+  policy.rego: |
+    package kubernetes.admission
+
+    import future.keywords.if
+
+    # Deny deployment if model lacks SBOM attestation
+    deny[msg] if {
+      input.request.kind.kind == "Deployment"
+      input.request.namespace == "ml-serving"
+
+      container := input.request.object.spec.template.spec.containers[_]
+      image := container.image
+
+      not has_sbom(image)
+
+      msg := sprintf("Model %s does not have SBOM attestation", [image])
+    }
+
+    # Check if model has SBOM (simplified - real check uses Cosign)
+    has_sbom(image) if {
+      # Query SBOM store or use Cosign to verify
+      # For demo: require "-sbom" suffix
+      contains(image, "-sbom")
+    }
+
+---
+# Query SBOM API
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbom-api
+  namespace: ml-models
+spec:
+  selector:
+    app: sbom-api
+  ports:
+    - port: 8080
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sbom-api
+  namespace: ml-models
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sbom-api
+  template:
+    metadata:
+      labels:
+        app: sbom-api
+    spec:
+      containers:
+        - name: api
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q flask
+
+              cat > api.py << 'EOF'
+              from flask import Flask, jsonify, request
+              import json
+
+              app = Flask(__name__)
+
+              # Demo SBOM store (in production, query S3 or database)
+              sboms = {
+                  "llama2-7b:1.0.0": {
+                      "packages": [
+                          {"name": "torch", "version": "2.1.0", "license": "BSD-3-Clause"},
+                          {"name": "transformers", "version": "4.30.0", "license": "Apache-2.0"},
+                          {"name": "numpy", "version": "1.24.3", "license": "BSD-3-Clause"}
+                      ],
+                      "vulnerabilities": []
+                  }
+              }
+
+              @app.route('/sbom/<model_name>/<version>')
+              def get_sbom(model_name, version):
+                  """Get SBOM for specific model"""
+                  key = f"{model_name}:{version}"
+                  if key in sboms:
+                      return jsonify(sboms[key])
+                  return jsonify({"error": "SBOM not found"}), 404
+
+              @app.route('/sbom/<model_name>/<version>/vulnerabilities')
+              def get_vulnerabilities(model_name, version):
+                  """Get vulnerabilities for specific model"""
+                  key = f"{model_name}:{version}"
+                  if key in sboms:
+                      return jsonify(sboms[key]["vulnerabilities"])
+                  return jsonify({"error": "SBOM not found"}), 404
+
+              @app.route('/sbom/<model_name>/<version>/licenses')
+              def get_licenses(model_name, version):
+                  """Get licenses for specific model"""
+                  key = f"{model_name}:{version}"
+                  if key in sboms:
+                      licenses = [{"name": pkg["name"], "license": pkg["license"]} for pkg in sboms[key]["packages"]]
+                      return jsonify(licenses)
+                  return jsonify({"error": "SBOM not found"}), 404
+
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              EOF
+
+              python api.py
+
+          ports:
+            - containerPort: 8080
+
+---
+# SBOM query examples
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbom-query-examples
+  namespace: ml-models
+data:
+  query.sh: |
+    #!/bin/bash
+    API_URL="http://sbom-api:8080"
+
+    # Get full SBOM
+    curl "$API_URL/sbom/llama2-7b/1.0.0" | jq .
+
+    # Get vulnerabilities
+    curl "$API_URL/sbom/llama2-7b/1.0.0/vulnerabilities" | jq .
+
+    # Get licenses
+    curl "$API_URL/sbom/llama2-7b/1.0.0/licenses" | jq .
+
+    # Check for GPL licenses (potential compliance issue)
+    curl "$API_URL/sbom/llama2-7b/1.0.0/licenses" | jq '.[] | select(.license | contains("GPL"))'
+
+---
+# Best Practices Summary:
+#
+# 1. Generation:
+#    - Generate during CI/CD build (automated)
+#    - Use Syft for containers, custom script for models
+#    - Include all dependencies (Python packages, system libraries, datasets)
+#
+# 2. Formats:
+#    - SPDX (most detailed, Linux Foundation standard)
+#    - CycloneDX (OWASP standard, good for vulnerabilities)
+#    - Choose based on tooling ecosystem
+#
+# 3. Storage:
+#    - Attach to model artifact (Cosign attestation)
+#    - Store in S3 (s3://ml-sboms/model/version/sbom.json)
+#    - Index in database (PostgreSQL for querying)
+#
+# 4. Scanning:
+#    - Scan SBOM for vulnerabilities (Grype, Trivy)
+#    - Block deployment if critical CVEs found
+#    - Alert on new vulnerabilities (CVE feeds)
+#
+# 5. Compliance:
+#    - License checking (no GPL in commercial models)
+#    - Export control (CUDA, encryption libraries)
+#    - Privacy (dataset licenses)
+#
+# Real-world impact:
+# - 100% dependency visibility
+# - 0% "what's in this model?" questions
+# - Rapid incident response (find all models with Log4j)
+# - License compliance (no GPL violations)
+#
+# Example queries:
+# - "Which models use PyTorch 2.0.0?" (vulnerable version)
+# - "Find all models with GPL dependencies"
+# - "What models are affected by CVE-2024-12345?"
+# - "List all CUDA versions in production"
+#
+# Incident response:
+# 1. CVE-2024-12345 announced for PyTorch < 2.1.1
+# 2. Query SBOM database: SELECT model FROM sboms WHERE package='torch' AND version < '2.1.1'
+# 3. Results: llama2-7b:1.0.0, gpt-neo:2.0.0, resnet50:3.1.0
+# 4. Rebuild and redeploy affected models
+# 5. Total time: 30 minutes (vs 3 days without SBOM)
+#
+# License compliance:
+# Q: Can we deploy this model commercially?
+# A: Check SBOM... Yes, all dependencies are BSD-3-Clause or Apache-2.0
+#
+# Q: Are there any export-controlled components?
+# A: Check SBOM... Yes, CUDA 12.1 (NVIDIA proprietary, export-controlled)

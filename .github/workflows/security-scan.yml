@@ -1,0 +1,50 @@
+# ABOUTME: Security scanning workflow for detecting hardcoded secrets and insecure configurations
+# ABOUTME: Scans all files for passwords, API keys, tokens, and Kubernetes security issues
+name: Security Scanning
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for better secret detection
+          fetch-depth: 0
+
+      - name: Run security scan
+        run: |
+          chmod +x scripts/security-scan.sh
+          ./scripts/security-scan.sh
+
+      - name: Create security report
+        if: failure()
+        run: |
+          echo "## Security Scan Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Security issues were detected. Please review the logs above." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Common Fixes:" >> $GITHUB_STEP_SUMMARY
+          echo "- Move secrets to GitHub Secrets or Kubernetes Secrets" >> $GITHUB_STEP_SUMMARY
+          echo "- Use placeholders like \`<CHANGE-ME-PASSWORD>\` for examples" >> $GITHUB_STEP_SUMMARY
+          echo "- Add security warnings for insecure patterns" >> $GITHUB_STEP_SUMMARY
+          echo "- Use HTTPS instead of HTTP for external URLs" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload security scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: scripts/security-scan.sh
+          retention-days: 30

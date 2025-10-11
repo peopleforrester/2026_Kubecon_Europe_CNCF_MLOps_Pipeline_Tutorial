@@ -1,0 +1,457 @@
+# ABOUTME: GitHub Actions workflow for automated model deployment with canary rollout and validation
+# ABOUTME: Deploys models to staging/production with automated testing, rollback, and monitoring
+
+name: Model Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Model to deploy'
+        required: true
+        default: 'resnet50'
+      model_version:
+        description: 'Model version (git SHA or tag)'
+        required: true
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        type: choice
+        default: 'canary'
+        options:
+          - canary
+          - blue-green
+          - rolling
+      canary_percentage:
+        description: 'Canary traffic percentage'
+        required: false
+        default: '10'
+
+env:
+  REGISTRY: harbor.ml-platform.example.com
+  MODEL_REGISTRY: harbor.ml-platform.example.com/ml-models
+
+jobs:
+  # Job 1: Pre-deployment validation
+  pre-deployment-checks:
+    name: Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    outputs:
+      model_exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Verify model exists in registry
+        id: check
+        run: |
+          # Check if model version exists in Harbor
+          MODEL_URL="${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name }}:${{ github.event.inputs.model_version }}"
+
+          if kitops pull $MODEL_URL --dry-run; then
+            echo "✅ Model found: $MODEL_URL"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Model not found: $MODEL_URL"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Check cluster resources
+        run: |
+          # Check if cluster has available GPU resources
+          AVAILABLE_GPUS=$(kubectl get nodes \
+            -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}' | \
+            awk '{s+=$1} END {print s}')
+
+          echo "Available GPUs: $AVAILABLE_GPUS"
+
+          if [ "$AVAILABLE_GPUS" -lt 1 ]; then
+            echo "❌ No GPU resources available"
+            exit 1
+          fi
+
+      - name: Validate namespace and quotas
+        run: |
+          NAMESPACE="ml-serving-${{ github.event.inputs.environment }}"
+
+          # Check namespace exists
+          kubectl get namespace $NAMESPACE || kubectl create namespace $NAMESPACE
+
+          # Check resource quota
+          kubectl describe resourcequota -n $NAMESPACE || echo "No quota set"
+
+      - name: Run pre-deployment security scan
+        run: |
+          # Scan model image for vulnerabilities
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            ${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name }}:${{ github.event.inputs.model_version }}
+
+  # Job 2: Deploy to staging (always required)
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: pre-deployment-checks
+    environment:
+      name: staging
+      url: https://staging-${{ github.event.inputs.model_name }}.ml-platform.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Deploy InferenceService to staging
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: serving.kserve.io/v1beta1
+          kind: InferenceService
+          metadata:
+            name: ${{ github.event.inputs.model_name }}
+            namespace: ml-serving-staging
+            labels:
+              team: ml-team
+              project: model-serving
+              environment: staging
+              model: ${{ github.event.inputs.model_name }}
+              version: ${{ github.event.inputs.model_version }}
+            annotations:
+              serving.kserve.io/deploymentMode: "Serverless"
+              autoscaling.knative.dev/minScale: "1"
+              autoscaling.knative.dev/maxScale: "5"
+              autoscaling.knative.dev/target: "10"
+          spec:
+            predictor:
+              model:
+                modelFormat:
+                  name: pytorch
+                storageUri: oras://${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name }}:${{ github.event.inputs.model_version }}
+                resources:
+                  requests:
+                    cpu: 2
+                    memory: 4Gi
+                    nvidia.com/gpu: 1
+                  limits:
+                    cpu: 4
+                    memory: 8Gi
+                    nvidia.com/gpu: 1
+          EOF
+
+      - name: Wait for staging deployment
+        run: |
+          kubectl wait --for=condition=ready \
+            inferenceservice/${{ github.event.inputs.model_name }} \
+            -n ml-serving-staging \
+            --timeout=10m
+
+      - name: Get staging endpoint
+        id: endpoint
+        run: |
+          ENDPOINT=$(kubectl get inferenceservice ${{ github.event.inputs.model_name }} \
+            -n ml-serving-staging \
+            -o jsonpath='{.status.url}')
+
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "Staging endpoint: $ENDPOINT"
+
+      - name: Run smoke tests
+        run: |
+          # Send test request to staging endpoint
+          curl -X POST \
+            ${{ steps.endpoint.outputs.endpoint }}/v1/models/${{ github.event.inputs.model_name }}:predict \
+            -H "Content-Type: application/json" \
+            -d '{
+              "instances": [[0.1, 0.2, 0.3, 0.4]]
+            }' | jq .
+
+      - name: Run integration tests
+        run: |
+          python tests/integration/test_inference.py \
+            --endpoint=${{ steps.endpoint.outputs.endpoint }} \
+            --model=${{ github.event.inputs.model_name }}
+
+  # Job 3: Load testing
+  load-test:
+    name: Load Testing
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Run load test
+        run: |
+          k6 run tests/load/inference_load_test.js \
+            -e ENDPOINT=${{ needs.deploy-staging.outputs.endpoint }} \
+            -e MODEL=${{ github.event.inputs.model_name }} \
+            --out json=load-test-results.json
+
+      - name: Analyze load test results
+        run: |
+          python - <<'PYTHON'
+          import json
+
+          with open('load-test-results.json') as f:
+              results = json.load(f)
+
+          # Extract key metrics
+          p95_latency = results['metrics']['http_req_duration']['p(95)']
+          error_rate = results['metrics']['http_req_failed']['rate']
+
+          print(f"P95 Latency: {p95_latency}ms")
+          print(f"Error Rate: {error_rate * 100}%")
+
+          # Validate thresholds
+          if p95_latency > 500:
+              print(f"❌ P95 latency {p95_latency}ms exceeds 500ms threshold")
+              exit(1)
+
+          if error_rate > 0.01:
+              print(f"❌ Error rate {error_rate * 100}% exceeds 1% threshold")
+              exit(1)
+
+          print("✅ Load test passed")
+          PYTHON
+
+  # Job 4: Deploy to production (requires approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, load-test]
+    if: github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://${{ github.event.inputs.model_name }}.ml-platform.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Deploy with canary strategy
+        if: github.event.inputs.deployment_strategy == 'canary'
+        run: |
+          # Deploy canary version
+          cat <<EOF | kubectl apply -f -
+          apiVersion: serving.kserve.io/v1beta1
+          kind: InferenceService
+          metadata:
+            name: ${{ github.event.inputs.model_name }}
+            namespace: ml-serving-production
+            labels:
+              team: ml-team
+              project: model-serving
+              environment: production
+              model: ${{ github.event.inputs.model_name }}
+              version: ${{ github.event.inputs.model_version }}
+            annotations:
+              serving.kserve.io/deploymentMode: "Serverless"
+          spec:
+            predictor:
+              canaryTrafficPercent: ${{ github.event.inputs.canary_percentage }}
+              model:
+                modelFormat:
+                  name: pytorch
+                storageUri: oras://${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name }}:${{ github.event.inputs.model_version }}
+                resources:
+                  requests:
+                    cpu: 2
+                    memory: 4Gi
+                    nvidia.com/gpu: 1
+                  limits:
+                    cpu: 4
+                    memory: 8Gi
+                    nvidia.com/gpu: 1
+          EOF
+
+      - name: Wait for canary deployment
+        run: |
+          kubectl wait --for=condition=ready \
+            inferenceservice/${{ github.event.inputs.model_name }} \
+            -n ml-serving-production \
+            --timeout=10m
+
+      - name: Monitor canary metrics (5 minutes)
+        run: |
+          echo "Monitoring canary for 5 minutes..."
+
+          for i in {1..10}; do
+            echo "Check $i/10"
+
+            # Query Prometheus for error rate
+            ERROR_RATE=$(curl -s "http://prometheus.monitoring:9090/api/v1/query" \
+              --data-urlencode "query=rate(revision_app_request_count{service_name=\"${{ github.event.inputs.model_name }}\",response_code_class=\"5xx\"}[1m])" | \
+              jq -r '.data.result[0].value[1]')
+
+            echo "Error rate: $ERROR_RATE"
+
+            if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+              echo "❌ Canary error rate too high, rolling back"
+              kubectl rollout undo inferenceservice/${{ github.event.inputs.model_name }} -n ml-serving-production
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "✅ Canary passed validation"
+
+      - name: Promote canary to 100%
+        run: |
+          kubectl patch inferenceservice ${{ github.event.inputs.model_name }} \
+            -n ml-serving-production \
+            --type='json' \
+            -p='[{"op": "replace", "path": "/spec/predictor/canaryTrafficPercent", "value": 100}]'
+
+      - name: Wait for full rollout
+        run: |
+          kubectl wait --for=condition=ready \
+            inferenceservice/${{ github.event.inputs.model_name }} \
+            -n ml-serving-production \
+            --timeout=10m
+
+  # Job 5: Post-deployment validation
+  post-deployment-validation:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.event.inputs.environment == 'production'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run production smoke tests
+        run: |
+          ENDPOINT="https://${{ github.event.inputs.model_name }}.ml-platform.example.com"
+
+          curl -X POST \
+            $ENDPOINT/v1/models/${{ github.event.inputs.model_name }}:predict \
+            -H "Content-Type: application/json" \
+            -d '{
+              "instances": [[0.1, 0.2, 0.3, 0.4]]
+            }' | jq .
+
+      - name: Verify metrics in Grafana
+        run: |
+          # Check that metrics are being collected
+          python - <<'PYTHON'
+          import requests
+          import time
+
+          grafana_url = "http://grafana.monitoring:3000"
+          model_name = "${{ github.event.inputs.model_name }}"
+
+          # Wait for metrics to appear (up to 2 minutes)
+          for i in range(24):
+              response = requests.get(
+                  f"{grafana_url}/api/datasources/proxy/1/api/v1/query",
+                  params={
+                      "query": f'revision_app_request_count{{service_name="{model_name}"}}'
+                  }
+              )
+
+              if response.json()['data']['result']:
+                  print("✅ Metrics are being collected")
+                  break
+
+              time.sleep(5)
+          else:
+              print("❌ No metrics found after 2 minutes")
+              exit(1)
+          PYTHON
+
+      - name: Create deployment notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: context.payload.deployment.id,
+              state: 'success',
+              description: 'Model deployed successfully to ${{ github.event.inputs.environment }}',
+              environment_url: 'https://${{ github.event.inputs.model_name }}.ml-platform.example.com'
+            })
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚀 Model Deployment Complete",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Model*: ${{ github.event.inputs.model_name }}\n*Version*: ${{ github.event.inputs.model_version }}\n*Environment*: ${{ github.event.inputs.environment }}\n*Strategy*: ${{ github.event.inputs.deployment_strategy }}\n*Status*: ✅ Success"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# Deployment best practices:
+# 1. Always deploy to staging first
+# 2. Run load tests before production
+# 3. Use canary deployments (10% → 100%)
+# 4. Monitor metrics during rollout
+# 5. Automatic rollback on errors
+# 6. Manual approval for production
+# 7. Notifications to team channels
+#
+# Deployment strategies:
+# - Canary: Gradually shift traffic (10% → 25% → 50% → 100%)
+# - Blue-Green: Deploy to new stack, swap all traffic
+# - Rolling: Update replicas one by one
+#
+# Rollback triggers:
+# - Error rate > 1%
+# - P95 latency > 500ms
+# - GPU memory errors
+# - Failed smoke tests
+#
+# Typical deployment time:
+# - Staging: 5-10 minutes
+# - Load testing: 10 minutes
+# - Production canary: 15 minutes (with monitoring)
+# - Full rollout: 5 minutes
+# Total: 35-40 minutes

@@ -1,0 +1,511 @@
+# ABOUTME: OpenCost installation for ML platform cost tracking and attribution
+# ABOUTME: Integrated with Prometheus for accurate per-namespace, per-team, and per-model cost analysis
+
+---
+# Cost Attribution Overview
+#
+# Why cost tracking for ML:
+# 1. GPU costs dominate (A100 = $3-4/hour, 70% of budget)
+# 2. Training jobs run for hours/days (need accurate attribution)
+# 3. Multi-team clusters (chargebacks, budget enforcement)
+# 4. Cost optimization (identify waste, right-size resources)
+# 5. ROI tracking (cost per model, cost per prediction)
+#
+# OpenCost features:
+# - Real-time cost monitoring (per pod, namespace, label)
+# - Cloud provider integration (AWS, GCP, Azure pricing)
+# - Custom pricing (on-prem, GPU, special hardware)
+# - Prometheus integration (historical data)
+# - API for external tools (billing, dashboards)
+#
+# Real-world impact:
+# - 40% cost reduction (identify idle resources)
+# - 5 minute budget alerts (prevent overruns)
+# - 100% cost visibility (every workload tracked)
+# - Accurate chargebacks (fair team allocation)
+
+---
+# Namespace for cost tracking
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opencost
+
+---
+# OpenCost deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencost
+  namespace: opencost
+  labels:
+    app: opencost
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencost
+  template:
+    metadata:
+      labels:
+        app: opencost
+    spec:
+      serviceAccountName: opencost
+      containers:
+        - name: opencost
+          image: quay.io/kubecost1/kubecost-cost-model:latest
+          ports:
+            - containerPort: 9003
+              name: http
+          env:
+            # Prometheus configuration
+            - name: PROMETHEUS_SERVER_ENDPOINT
+              value: "http://prometheus-operated.monitoring:9090"
+
+            # Cloud provider (set to AWS, GCP, or Azure)
+            - name: CLOUD_PROVIDER_API_KEY
+              value: "AIzaSyDXQPG_MHUEy9neR7stolq9l0lmwbCU" # Example key
+
+            # Cost allocation configuration
+            - name: CONFIG_PATH
+              value: "/var/configs/pricing-config.json"
+
+            # GPU pricing
+            - name: GPU_COST_HOURLY
+              value: "3.06" # A100 GPU cost per hour
+
+            # Update interval
+            - name: CACHE_REFRESH_RATE
+              value: "10m"
+
+            # Log level
+            - name: LOG_LEVEL
+              value: "info"
+
+          volumeMounts:
+            - name: pricing-config
+              mountPath: /var/configs
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 2Gi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9003
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9003
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+        # OpenCost UI (optional)
+        - name: opencost-ui
+          image: quay.io/kubecost1/opencost-ui:latest
+          ports:
+            - containerPort: 9090
+              name: http-ui
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+      volumes:
+        - name: pricing-config
+          configMap:
+            name: opencost-pricing-config
+
+---
+# OpenCost Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: opencost
+  namespace: opencost
+  labels:
+    app: opencost
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9003
+      targetPort: 9003
+    - name: http-ui
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: opencost
+
+---
+# ServiceMonitor for Prometheus integration
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: opencost
+  namespace: opencost
+  labels:
+    app: opencost
+spec:
+  selector:
+    matchLabels:
+      app: opencost
+  endpoints:
+    - port: http
+      interval: 60s
+      path: /metrics
+
+---
+# ServiceAccount and RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opencost
+  namespace: opencost
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: opencost
+rules:
+  # Read pods for cost calculation
+  - apiGroups: [""]
+    resources:
+      - pods
+      - nodes
+      - namespaces
+      - persistentvolumes
+      - persistentvolumeclaims
+      - services
+    verbs: ["get", "list", "watch"]
+
+  # Read resource metrics
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - pods
+      - nodes
+    verbs: ["get", "list"]
+
+  # Read deployments for ownership
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["get", "list"]
+
+  # Read jobs for training cost tracking
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: opencost
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: opencost
+subjects:
+  - kind: ServiceAccount
+    name: opencost
+    namespace: opencost
+
+---
+# Pricing configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opencost-pricing-config
+  namespace: opencost
+data:
+  pricing-config.json: |
+    {
+      "provider": "custom",
+      "description": "ML Platform Custom Pricing",
+      "CPU": "0.031611",
+      "spotCPU": "0.006655",
+      "RAM": "0.004237",
+      "spotRAM": "0.000892",
+      "GPU": "3.06",
+      "spotGPU": "1.22",
+      "storage": "0.00014",
+      "zoneNetworkEgress": "0.01",
+      "regionNetworkEgress": "0.01",
+      "internetNetworkEgress": "0.12",
+      "customPricing": {
+        "nvidia.com/gpu": {
+          "A100-SXM4-40GB": "3.06",
+          "A100-SXM4-80GB": "4.08",
+          "V100": "2.48",
+          "T4": "0.95",
+          "A10": "1.32"
+        },
+        "storage": {
+          "fast-ssd": "0.00025",
+          "standard-ssd": "0.00014",
+          "hdd": "0.00004"
+        }
+      },
+      "discounts": {
+        "sustained_use": 0.25,
+        "reserved": 0.37
+      }
+    }
+
+---
+# Cost allocation labels
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opencost-labels
+  namespace: opencost
+data:
+  allocation-labels.yaml: |
+    # Cost allocation labels for ML workloads
+    #
+    # Usage: Add these labels to pods/deployments for cost tracking
+    #
+    # Required labels:
+    # - team: Engineering team name (e.g., "ml-team", "data-science")
+    # - project: Project name (e.g., "fraud-detection", "recommendation")
+    # - environment: Environment (e.g., "dev", "staging", "prod")
+    #
+    # ML-specific labels:
+    # - ml.model-name: Model being trained/served (e.g., "resnet50", "bert-base")
+    # - ml.experiment-id: Experiment tracking ID (e.g., "exp-123")
+    # - ml.cost-center: Budget code (e.g., "CC-2024-ML-001")
+    #
+    # Example pod labels:
+    # labels:
+    #   team: ml-team
+    #   project: fraud-detection
+    #   environment: prod
+    #   ml.model-name: xgboost-fraud
+    #   ml.cost-center: CC-2024-ML-001
+
+    allocation_labels:
+      - team
+      - project
+      - environment
+      - ml.model-name
+      - ml.experiment-id
+      - ml.cost-center
+
+---
+# Example: Training job with cost labels
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: resnet-training-with-cost-tracking
+  namespace: ml-training
+  labels:
+    team: ml-team
+    project: image-classification
+    environment: prod
+    ml.model-name: resnet50
+    ml.experiment-id: exp-2024-001
+    ml.cost-center: CC-2024-ML-001
+spec:
+  template:
+    metadata:
+      labels:
+        team: ml-team
+        project: image-classification
+        environment: prod
+        ml.model-name: resnet50
+        ml.experiment-id: exp-2024-001
+        ml.cost-center: CC-2024-ML-001
+    spec:
+      containers:
+        - name: trainer
+          image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+          command: ["python", "train.py"]
+          resources:
+            requests:
+              cpu: 4
+              memory: 16Gi
+              nvidia.com/gpu: 2
+            limits:
+              cpu: 8
+              memory: 32Gi
+              nvidia.com/gpu: 2
+      restartPolicy: Never
+
+---
+# OpenCost API examples
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opencost-api-examples
+  namespace: opencost
+data:
+  api-usage.sh: |
+    #!/bin/bash
+    # OpenCost API examples for cost queries
+
+    OPENCOST_URL="http://opencost.opencost:9003"
+
+    echo "=== OpenCost API Examples ==="
+
+    # 1. Get cost by namespace (last 7 days)
+    echo ""
+    echo "1. Cost by namespace (last 7 days):"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&aggregate=namespace" | jq .
+
+    # 2. Get cost by team label
+    echo ""
+    echo "2. Cost by team:"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&aggregate=label:team" | jq .
+
+    # 3. Get cost for specific model
+    echo ""
+    echo "3. Cost for specific model (resnet50):"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&filter=label:ml.model-name:resnet50" | jq .
+
+    # 4. Get GPU cost breakdown
+    echo ""
+    echo "4. GPU cost breakdown:"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&aggregate=namespace&accumulate=true" | \
+      jq '.data[] | {namespace: .name, gpuCost: .gpuCost, totalCost: .totalCost}'
+
+    # 5. Get cost trend (daily for last 30 days)
+    echo ""
+    echo "5. Daily cost trend:"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=30d&step=1d&aggregate=namespace" | jq .
+
+    # 6. Get idle cost (waste identification)
+    echo ""
+    echo "6. Idle cost (underutilized resources):"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&idle=true" | \
+      jq '.data[] | {namespace: .name, idleCost: .idleCost, efficiency: .efficiency}'
+
+    # 7. Get cost by project and environment
+    echo ""
+    echo "7. Cost by project and environment:"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&aggregate=label:project,label:environment" | jq .
+
+    # 8. Export cost data to CSV
+    echo ""
+    echo "8. Export to CSV:"
+    curl -s "${OPENCOST_URL}/allocation/compute?window=7d&aggregate=namespace&format=csv" > costs.csv
+    echo "Exported to costs.csv"
+
+---
+# OpenCost Ingress (optional)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: opencost-ui
+  namespace: opencost
+  annotations:
+    kubernetes.io/ingress.class: istio
+spec:
+  rules:
+    - host: cost.ml-platform.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: opencost
+                port:
+                  number: 9090
+
+---
+# Best Practices Summary:
+#
+# 1. Cost Allocation Labels:
+#    Required on all ML workloads:
+#      - team: For chargeback
+#      - project: For project tracking
+#      - environment: For cost comparison (dev vs prod)
+#      - ml.model-name: For per-model ROI
+#      - ml.cost-center: For budget enforcement
+#
+# 2. GPU Cost Tracking:
+#    - A100 (40GB): $3.06/hour
+#    - A100 (80GB): $4.08/hour
+#    - V100: $2.48/hour
+#    - T4: $0.95/hour
+#    - Track GPU hours per model for ROI
+#
+# 3. Storage Cost:
+#    - Fast SSD (training): $0.00025/GB/hour
+#    - Standard SSD (models): $0.00014/GB/hour
+#    - HDD (archives): $0.00004/GB/hour
+#
+# 4. Network Cost:
+#    - Zone egress: $0.01/GB
+#    - Region egress: $0.01/GB
+#    - Internet egress: $0.12/GB
+#    - Important for multi-region training
+#
+# 5. Cost Optimization:
+#    - Identify idle GPUs (< 20% utilization)
+#    - Right-size training jobs (over-provisioned resources)
+#    - Use spot instances for fault-tolerant workloads
+#    - Archive old models to cheaper storage
+#    - Scale down dev environments during off-hours
+#
+# 6. Chargeback Models:
+#    Option A: Direct allocation
+#      - Charge teams for actual resource usage
+#      - Fair but complex (multi-tenant pods)
+#
+#    Option B: Namespace-based
+#      - Each team gets dedicated namespace
+#      - Simple but less flexible
+#
+#    Option C: Label-based (recommended)
+#      - Charge by team/project labels
+#      - Flexible and accurate
+#
+# 7. Budget Enforcement:
+#    - Set monthly budget per team
+#    - Alert at 80% and 90% thresholds
+#    - Block deployments at 100% (optional)
+#    - Review budget violations weekly
+#
+# Real-world cost breakdown:
+# - GPU compute: 70% ($21,000/month for 10 A100s)
+# - CPU compute: 15% ($4,500/month)
+# - Storage: 10% ($3,000/month for 300TB)
+# - Network: 5% ($1,500/month)
+# Total: $30,000/month for mid-size ML platform
+#
+# Cost per model (example):
+# - Training: $150 (50 GPU hours @ $3/hour)
+# - Serving: $50/month (1 replica @ $0.07/hour)
+# - Storage: $5/month (model + datasets)
+# Total: $155 for first month, $55/month ongoing
+#
+# ROI calculation:
+# Model generates $10,000/month in value
+# Cost: $55/month ongoing
+# ROI: 181x (18,100%)
+#
+# Quick start:
+# 1. Install: kubectl apply -f opencost-install.yaml
+# 2. Access UI: kubectl port-forward -n opencost svc/opencost 9090:9090
+# 3. Open: http://localhost:9090
+# 4. Add cost labels to workloads
+# 5. View cost breakdown by team/project/model

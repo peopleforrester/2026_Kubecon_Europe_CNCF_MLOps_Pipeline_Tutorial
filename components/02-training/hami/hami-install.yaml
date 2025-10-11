@@ -1,0 +1,340 @@
+# ABOUTME: HAMi GPU virtualization installation for cost-efficient GPU sharing
+# ABOUTME: Achieves 57% cost savings by allowing multiple pods to share GPUs without time-slicing latency
+
+---
+# Install HAMi using Helm (recommended):
+# helm repo add hami-charts https://project-hami.github.io/HAMi/
+# helm install hami hami-charts/hami --set scheduler.kubeScheduler.imageTag=v1.28.0 -n kube-system
+#
+# Or apply this custom installation:
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hami-system
+  labels:
+    app: hami
+
+---
+# HAMi Device Plugin DaemonSet
+# Runs on every GPU node to virtualize GPUs
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hami-device-plugin
+  namespace: hami-system
+  labels:
+    app: hami-device-plugin
+spec:
+  selector:
+    matchLabels:
+      app: hami-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: hami-device-plugin
+    spec:
+      nodeSelector:
+        nvidia.com/gpu: "true"  # Only run on GPU nodes
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      hostNetwork: true
+      hostPID: true
+      priorityClassName: system-node-critical
+      containers:
+        - name: hami-device-plugin
+          image: projecthami/hami:v2.4.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - hami-device-plugin
+            - -v=5
+            - -logtostderr=true
+            - -enable-vgpu=true
+            - -enable-vgpu-memory-isolation=true
+            - -enable-vgpu-core-isolation=false  # Set to true for compute isolation
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOOK_PATH
+              value: "/usr/local/vgpu/hook"
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+            - name: vgpu-hook
+              mountPath: /usr/local/vgpu
+            - name: host-dev
+              mountPath: /dev
+            - name: host-sys
+              mountPath: /sys
+            - name: host-proc
+              mountPath: /host/proc
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+            type: Directory
+        - name: vgpu-hook
+          hostPath:
+            path: /usr/local/vgpu
+            type: DirectoryOrCreate
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+
+---
+# HAMi Scheduler Extender
+# Extends Kubernetes scheduler to handle vGPU scheduling
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hami-scheduler
+  namespace: hami-system
+  labels:
+    app: hami-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hami-scheduler
+  template:
+    metadata:
+      labels:
+        app: hami-scheduler
+    spec:
+      serviceAccountName: hami-scheduler
+      priorityClassName: system-cluster-critical
+      containers:
+        - name: hami-scheduler
+          image: projecthami/hami:v2.4.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - hami-scheduler
+            - -v=5
+            - -logtostderr=true
+            - --bind-address=0.0.0.0
+            - --port=32766
+          ports:
+            - containerPort: 32766
+              name: http
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 32766
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 32766
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+---
+# Service for HAMi Scheduler
+apiVersion: v1
+kind: Service
+metadata:
+  name: hami-scheduler
+  namespace: hami-system
+  labels:
+    app: hami-scheduler
+spec:
+  type: ClusterIP
+  ports:
+    - port: 32766
+      targetPort: 32766
+      protocol: TCP
+      name: http
+  selector:
+    app: hami-scheduler
+
+---
+# ServiceAccount for HAMi Scheduler
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hami-scheduler
+  namespace: hami-system
+
+---
+# ClusterRole for HAMi Scheduler
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hami-scheduler
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/binding"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hami-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hami-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: hami-scheduler
+    namespace: hami-system
+
+---
+# ConfigMap for HAMi Scheduler Policy
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hami-scheduler-policy
+  namespace: hami-system
+data:
+  policy.cfg: |
+    {
+      "kind": "Policy",
+      "apiVersion": "v1",
+      "extenders": [
+        {
+          "urlPrefix": "http://hami-scheduler.hami-system.svc.cluster.local:32766/scheduler",
+          "filterVerb": "filter",
+          "bindVerb": "bind",
+          "enableHTTPS": false,
+          "nodeCacheCapable": false,
+          "managedResources": [
+            {
+              "name": "nvidia.com/gpu",
+              "ignoredByScheduler": false
+            },
+            {
+              "name": "nvidia.com/gpumem",
+              "ignoredByScheduler": false
+            },
+            {
+              "name": "nvidia.com/gpucores",
+              "ignoredByScheduler": false
+            }
+          ],
+          "ignorable": false
+        }
+      ]
+    }
+
+---
+# Webhook Configuration (for admission control)
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: hami-webhook
+webhooks:
+  - name: hami-webhook.hami-system.svc
+    clientConfig:
+      service:
+        name: hami-webhook
+        namespace: hami-system
+        path: "/mutate"
+      caBundle: ""  # Will be filled by cert-manager or manual setup
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    admissionReviewVersions: ["v1", "v1beta1"]
+    sideEffects: None
+    failurePolicy: Ignore
+
+---
+# Example pod using vGPU (will be scheduled by HAMi)
+# apiVersion: v1
+# kind: Pod
+# metadata:
+#   name: gpu-pod-example
+# spec:
+#   containers:
+#     - name: gpu-container
+#       image: nvidia/cuda:11.7.1-base-ubuntu20.04
+#       command: ["sleep", "infinity"]
+#       resources:
+#         limits:
+#           nvidia.com/gpu: 1  # Request 1 vGPU
+#           nvidia.com/gpumem: 2000  # Request 2000 MiB GPU memory
+#           nvidia.com/gpucores: 50  # Request 50% GPU cores (optional)
+
+---
+# Quick install command (Helm recommended):
+# helm repo add hami-charts https://project-hami.github.io/HAMi/
+# helm repo update
+# helm install hami hami-charts/hami \
+#   --set scheduler.kubeScheduler.imageTag=v1.28.0 \
+#   --set devicePlugin.enabled=true \
+#   --namespace hami-system \
+#   --create-namespace
+#
+# Verify installation:
+# kubectl get pods -n hami-system
+# kubectl logs -n hami-system -l app=hami-device-plugin
+#
+# Check GPU resources:
+# kubectl describe node <gpu-node-name> | grep nvidia.com
+#
+# Expected output:
+#   nvidia.com/gpu: 8
+#   nvidia.com/gpumem: 80000 (total GPU memory in MiB)
+#   nvidia.com/gpucores: 800 (total GPU cores, 8 GPUs * 100)

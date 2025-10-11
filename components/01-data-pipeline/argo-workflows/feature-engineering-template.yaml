@@ -1,0 +1,515 @@
+# ABOUTME: Reusable feature engineering templates for ML data pipeline
+# ABOUTME: Modular transformations for scaling, encoding, dimensionality reduction, and feature selection
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: feature-engineering-library
+  namespace: argo
+  labels:
+    app: ml-data-pipeline
+    component: feature-engineering
+spec:
+  templates:
+    # Template: Numerical feature scaling
+    - name: numerical-scaling
+      inputs:
+        parameters:
+          - name: method
+            value: "standard"  # standard, minmax, robust
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: scaled-data
+            path: /data/output.parquet
+            s3:
+              key: "scaled-data/{{workflow.name}}/{{pod.name}}/output.parquet"
+          - name: scaler-params
+            path: /data/scaler.pkl
+            s3:
+              key: "scalers/{{workflow.name}}/{{pod.name}}/scaler.pkl"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scikit-learn
+            python3 << 'EOF'
+            import pandas as pd
+            import pickle
+            from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+
+            # Load data
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Select scaler
+            method = '{{inputs.parameters.method}}'
+            if method == 'standard':
+                scaler = StandardScaler()
+            elif method == 'minmax':
+                scaler = MinMaxScaler()
+            elif method == 'robust':
+                scaler = RobustScaler()
+            else:
+                raise ValueError(f"Unknown scaling method: {method}")
+
+            # Identify numerical columns
+            numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+            # Fit and transform
+            df[numerical_cols] = scaler.fit_transform(df[numerical_cols])
+
+            # Save scaled data
+            df.to_parquet('/data/output.parquet', index=False)
+
+            # Save scaler parameters for inference
+            with open('/data/scaler.pkl', 'wb') as f:
+                pickle.dump(scaler, f)
+
+            print(f"Scaled {len(numerical_cols)} numerical features using {method} scaler")
+            print(f"Processed {len(df)} records")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Categorical encoding
+    - name: categorical-encoding
+      inputs:
+        parameters:
+          - name: method
+            value: "onehot"  # onehot, label, target
+          - name: max-categories
+            value: "100"
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: encoded-data
+            path: /data/output.parquet
+            s3:
+              key: "encoded-data/{{workflow.name}}/{{pod.name}}/output.parquet"
+          - name: encoder-params
+            path: /data/encoder.pkl
+            s3:
+              key: "encoders/{{workflow.name}}/{{pod.name}}/encoder.pkl"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scikit-learn category_encoders
+            python3 << 'EOF'
+            import pandas as pd
+            import pickle
+            from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+            from category_encoders import TargetEncoder
+
+            # Load data
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Identify categorical columns
+            categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+            method = '{{inputs.parameters.method}}'
+            max_categories = int('{{inputs.parameters.max-categories}}')
+
+            if method == 'onehot':
+                encoder = OneHotEncoder(
+                    max_categories=max_categories,
+                    handle_unknown='infrequent_if_exist',
+                    sparse_output=False
+                )
+                encoded = encoder.fit_transform(df[categorical_cols])
+
+                # Create column names
+                feature_names = encoder.get_feature_names_out(categorical_cols)
+
+                # Replace categorical columns with encoded ones
+                df = df.drop(columns=categorical_cols)
+                encoded_df = pd.DataFrame(encoded, columns=feature_names, index=df.index)
+                df = pd.concat([df, encoded_df], axis=1)
+
+            elif method == 'label':
+                encoder = {}
+                for col in categorical_cols:
+                    le = LabelEncoder()
+                    df[col] = le.fit_transform(df[col].astype(str))
+                    encoder[col] = le
+
+            else:
+                raise ValueError(f"Unknown encoding method: {method}")
+
+            # Save encoded data
+            df.to_parquet('/data/output.parquet', index=False)
+
+            # Save encoder
+            with open('/data/encoder.pkl', 'wb') as f:
+                pickle.dump(encoder, f)
+
+            print(f"Encoded {len(categorical_cols)} categorical features using {method}")
+            print(f"Output shape: {df.shape}")
+            EOF
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 8Gi
+            cpu: "4"
+
+    # Template: Dimensionality reduction
+    - name: dimensionality-reduction
+      inputs:
+        parameters:
+          - name: method
+            value: "pca"  # pca, tsne, umap
+          - name: n-components
+            value: "50"
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: reduced-data
+            path: /data/output.parquet
+            s3:
+              key: "reduced-data/{{workflow.name}}/{{pod.name}}/output.parquet"
+          - name: reducer-params
+            path: /data/reducer.pkl
+            s3:
+              key: "reducers/{{workflow.name}}/{{pod.name}}/reducer.pkl"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scikit-learn umap-learn
+            python3 << 'EOF'
+            import pandas as pd
+            import pickle
+            from sklearn.decomposition import PCA
+            from sklearn.manifold import TSNE
+            try:
+                import umap
+            except ImportError:
+                umap = None
+
+            # Load data
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Get numerical features
+            numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+            X = df[numerical_cols].values
+
+            method = '{{inputs.parameters.method}}'
+            n_components = int('{{inputs.parameters.n-components}}')
+
+            # Select reducer
+            if method == 'pca':
+                reducer = PCA(n_components=n_components, random_state=42)
+            elif method == 'tsne':
+                reducer = TSNE(n_components=min(n_components, 3), random_state=42)
+            elif method == 'umap':
+                if umap is None:
+                    raise ImportError("UMAP not available")
+                reducer = umap.UMAP(n_components=n_components, random_state=42)
+            else:
+                raise ValueError(f"Unknown reduction method: {method}")
+
+            # Transform
+            X_reduced = reducer.fit_transform(X)
+
+            # Create new dataframe with reduced features
+            reduced_cols = [f'{method}_component_{i}' for i in range(X_reduced.shape[1])]
+            df_reduced = pd.DataFrame(X_reduced, columns=reduced_cols, index=df.index)
+
+            # Keep non-numerical columns
+            non_numerical_cols = df.select_dtypes(exclude=['int64', 'float64']).columns.tolist()
+            df_final = pd.concat([df[non_numerical_cols], df_reduced], axis=1)
+
+            # Save reduced data
+            df_final.to_parquet('/data/output.parquet', index=False)
+
+            # Save reducer
+            with open('/data/reducer.pkl', 'wb') as f:
+                pickle.dump(reducer, f)
+
+            print(f"Reduced {len(numerical_cols)} features to {X_reduced.shape[1]} using {method}")
+            if hasattr(reducer, 'explained_variance_ratio_'):
+                print(f"Explained variance: {reducer.explained_variance_ratio_.sum():.2%}")
+            EOF
+        resources:
+          requests:
+            memory: 8Gi
+            cpu: "4"
+          limits:
+            memory: 16Gi
+            cpu: "8"
+
+    # Template: Feature selection
+    - name: feature-selection
+      inputs:
+        parameters:
+          - name: method
+            value: "variance"  # variance, mutual_info, rfe
+          - name: k-features
+            value: "100"
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+          - name: target
+            path: /data/target.parquet
+            optional: true
+      outputs:
+        artifacts:
+          - name: selected-data
+            path: /data/output.parquet
+            s3:
+              key: "selected-data/{{workflow.name}}/{{pod.name}}/output.parquet"
+          - name: selected-features
+            path: /data/features.json
+            s3:
+              key: "selected-features/{{workflow.name}}/{{pod.name}}/features.json"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scikit-learn
+            python3 << 'EOF'
+            import pandas as pd
+            import json
+            from sklearn.feature_selection import VarianceThreshold, SelectKBest, mutual_info_regression, RFE
+            from sklearn.ensemble import RandomForestRegressor
+
+            # Load data
+            df = pd.read_parquet('/data/input.parquet')
+            numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+            X = df[numerical_cols]
+
+            method = '{{inputs.parameters.method}}'
+            k = int('{{inputs.parameters.k-features}}')
+
+            # Select method
+            if method == 'variance':
+                # Remove low-variance features
+                selector = VarianceThreshold(threshold=0.01)
+                X_selected = selector.fit_transform(X)
+                selected_features = X.columns[selector.get_support()].tolist()
+
+            elif method == 'mutual_info':
+                # Load target if available
+                try:
+                    y = pd.read_parquet('/data/target.parquet').squeeze()
+                    selector = SelectKBest(score_func=mutual_info_regression, k=min(k, len(numerical_cols)))
+                    X_selected = selector.fit_transform(X, y)
+                    selected_features = X.columns[selector.get_support()].tolist()
+                except Exception as e:
+                    print(f"Target not available, falling back to variance: {e}")
+                    selector = VarianceThreshold(threshold=0.01)
+                    X_selected = selector.fit_transform(X)
+                    selected_features = X.columns[selector.get_support()].tolist()
+
+            elif method == 'rfe':
+                # Recursive feature elimination
+                try:
+                    y = pd.read_parquet('/data/target.parquet').squeeze()
+                    estimator = RandomForestRegressor(n_estimators=10, random_state=42)
+                    selector = RFE(estimator, n_features_to_select=min(k, len(numerical_cols)))
+                    X_selected = selector.fit_transform(X, y)
+                    selected_features = X.columns[selector.get_support()].tolist()
+                except Exception as e:
+                    print(f"RFE failed, falling back to variance: {e}")
+                    selector = VarianceThreshold(threshold=0.01)
+                    X_selected = selector.fit_transform(X)
+                    selected_features = X.columns[selector.get_support()].tolist()
+
+            else:
+                raise ValueError(f"Unknown selection method: {method}")
+
+            # Create output dataframe
+            df_selected = pd.DataFrame(X_selected, columns=selected_features, index=df.index)
+
+            # Keep non-numerical columns
+            non_numerical_cols = df.select_dtypes(exclude=['int64', 'float64']).columns.tolist()
+            df_final = pd.concat([df[non_numerical_cols], df_selected], axis=1)
+
+            # Save selected data
+            df_final.to_parquet('/data/output.parquet', index=False)
+
+            # Save selected feature names
+            with open('/data/features.json', 'w') as f:
+                json.dump({'selected_features': selected_features, 'method': method}, f, indent=2)
+
+            print(f"Selected {len(selected_features)} features using {method}")
+            print(f"Original features: {len(numerical_cols)}")
+            EOF
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 8Gi
+            cpu: "4"
+
+    # Template: Time-series feature engineering
+    - name: timeseries-features
+      inputs:
+        parameters:
+          - name: window-size
+            value: "7"
+          - name: timestamp-col
+            value: "timestamp"
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: timeseries-features
+            path: /data/output.parquet
+            s3:
+              key: "timeseries-features/{{workflow.name}}/{{pod.name}}/output.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+
+            # Load data
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Sort by timestamp
+            timestamp_col = '{{inputs.parameters.timestamp-col}}'
+            df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+            df = df.sort_values(timestamp_col)
+
+            window = int('{{inputs.parameters.window-size}}')
+
+            # Create rolling features
+            numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns.tolist()
+
+            for col in numerical_cols:
+                # Rolling mean
+                df[f'{col}_rolling_mean_{window}d'] = df[col].rolling(window=window).mean()
+
+                # Rolling std
+                df[f'{col}_rolling_std_{window}d'] = df[col].rolling(window=window).std()
+
+                # Rolling min/max
+                df[f'{col}_rolling_min_{window}d'] = df[col].rolling(window=window).min()
+                df[f'{col}_rolling_max_{window}d'] = df[col].rolling(window=window).max()
+
+                # Lag features
+                df[f'{col}_lag_1'] = df[col].shift(1)
+                df[f'{col}_lag_7'] = df[col].shift(7)
+
+            # Drop NaN rows from rolling calculations
+            df = df.dropna()
+
+            # Save
+            df.to_parquet('/data/output.parquet', index=False)
+
+            print(f"Created time-series features with {window}-day window")
+            print(f"Output shape: {df.shape}")
+            EOF
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 8Gi
+            cpu: "4"
+
+    # Template: Complete feature engineering pipeline (DAG)
+    - name: complete-pipeline
+      inputs:
+        artifacts:
+          - name: raw-data
+            path: /data/raw.parquet
+      dag:
+        tasks:
+          # Step 1: Scale numerical features
+          - name: scale-features
+            template: numerical-scaling
+            arguments:
+              parameters:
+                - name: method
+                  value: "standard"
+              artifacts:
+                - name: input-data
+                  from: "{{inputs.artifacts.raw-data}}"
+
+          # Step 2: Encode categorical features (parallel)
+          - name: encode-categoricals
+            template: categorical-encoding
+            dependencies: [scale-features]
+            arguments:
+              parameters:
+                - name: method
+                  value: "onehot"
+                - name: max-categories
+                  value: "50"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.scale-features.outputs.artifacts.scaled-data}}"
+
+          # Step 3: Feature selection
+          - name: select-features
+            template: feature-selection
+            dependencies: [encode-categoricals]
+            arguments:
+              parameters:
+                - name: method
+                  value: "variance"
+                - name: k-features
+                  value: "200"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.encode-categoricals.outputs.artifacts.encoded-data}}"
+
+          # Step 4: Dimensionality reduction
+          - name: reduce-dimensions
+            template: dimensionality-reduction
+            dependencies: [select-features]
+            arguments:
+              parameters:
+                - name: method
+                  value: "pca"
+                - name: n-components
+                  value: "50"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.select-features.outputs.artifacts.selected-data}}"
+
+---
+# Example: Use feature engineering template in a workflow
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: feature-engineering-
+  namespace: argo
+spec:
+  entrypoint: main
+  templates:
+    - name: main
+      steps:
+        - - name: engineer-features
+            templateRef:
+              name: feature-engineering-library
+              template: complete-pipeline
+            arguments:
+              artifacts:
+                - name: raw-data
+                  s3:
+                    key: "raw-data/sample.parquet"

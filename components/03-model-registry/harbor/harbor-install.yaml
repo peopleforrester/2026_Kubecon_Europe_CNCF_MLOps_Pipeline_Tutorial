@@ -1,0 +1,305 @@
+# ABOUTME: Harbor container registry installation for ML model artifacts and container images
+# ABOUTME: CNCF Graduated project providing secure storage, vulnerability scanning, and image signing
+
+---
+# Install Harbor using Helm (recommended):
+# helm repo add harbor https://helm.goharbor.io
+# helm install harbor harbor/harbor \
+#   --namespace harbor \
+#   --create-namespace \
+#   --set expose.type=loadBalancer \
+#   --set expose.tls.auto.commonName=harbor.example.com \
+#   --set persistence.enabled=true \
+#   --set persistence.persistentVolumeClaim.registry.size=500Gi \
+#   --set harborAdminPassword=<strong-password>
+
+---
+# Harbor Configuration Values (values.yaml)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harbor-config
+  namespace: harbor
+data:
+  values.yaml: |
+    # Expose Harbor via LoadBalancer (change to Ingress for production)
+    expose:
+      type: loadBalancer
+      tls:
+        enabled: true
+        certSource: auto
+        auto:
+          commonName: "harbor.ml-platform.example.com"
+      loadBalancer:
+        name: harbor
+        IP: ""
+        ports:
+          httpPort: 80
+          httpsPort: 443
+
+    # External URL
+    externalURL: https://harbor.ml-platform.example.com
+
+    # ⚠️ SECURITY WARNING: Change this password before deployment!
+    # Generate a strong password: openssl rand -base64 32
+    # For production, use external secrets management (Vault, External Secrets Operator)
+    harborAdminPassword: "<CHANGE-ME-STRONG-PASSWORD>"  # REQUIRED: Set strong password (min 12 chars)
+
+    # Persistence
+    persistence:
+      enabled: true
+      resourcePolicy: "keep"
+      persistentVolumeClaim:
+        registry:
+          storageClass: "standard"
+          size: 500Gi  # Store model containers and artifacts
+        chartmuseum:
+          storageClass: "standard"
+          size: 5Gi
+        jobservice:
+          storageClass: "standard"
+          size: 1Gi
+        database:
+          storageClass: "standard"
+          size: 10Gi
+        redis:
+          storageClass: "standard"
+          size: 1Gi
+        trivy:
+          storageClass: "standard"
+          size: 5Gi
+
+    # Database (PostgreSQL)
+    database:
+      type: internal
+      internal:
+        password: "<CHANGE-ME-DB-PASSWORD>"  # ⚠️ SECURITY: Set strong database password
+
+    # Redis
+    redis:
+      type: internal
+
+    # Trivy (vulnerability scanner)
+    trivy:
+      enabled: true
+      gitHubToken: ""  # Optional: GitHub token for faster DB updates
+      severity: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+      ignoreUnfixed: false
+      insecure: false
+
+    # Notary (image signing)
+    notary:
+      enabled: true
+
+    # Chart Museum (Helm chart repository)
+    chartmuseum:
+      enabled: true
+
+    # Metrics
+    metrics:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+        interval: 30s
+
+    # Core service
+    core:
+      replicas: 2  # HA
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: 100m
+        limits:
+          memory: 512Mi
+          cpu: 500m
+
+    # Registry service
+    registry:
+      replicas: 2  # HA
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: 100m
+        limits:
+          memory: 512Mi
+          cpu: 500m
+
+---
+# Projects for ML artifacts
+# Create via Harbor UI or API after installation
+
+# Example: Create ML model project
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harbor-projects-init
+  namespace: harbor
+data:
+  init-projects.sh: |
+    #!/bin/bash
+    # Wait for Harbor to be ready
+    until curl -k -f https://harbor.ml-platform.example.com/api/v2.0/systeminfo; do
+      echo "Waiting for Harbor..."
+      sleep 5
+    done
+
+    # Login
+    HARBOR_URL="https://harbor.ml-platform.example.com"
+    HARBOR_USER="admin"
+    HARBOR_PASSWORD="<YOUR-HARBOR-PASSWORD>"  # Use the password you set during installation
+
+    # Create projects
+    curl -X POST "$HARBOR_URL/api/v2.0/projects" \
+      -u "$HARBOR_USER:$HARBOR_PASSWORD" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "project_name": "ml-models",
+        "public": false,
+        "metadata": {
+          "auto_scan": "true",
+          "severity": "high",
+          "reuse_sys_cve_allowlist": "true"
+        }
+      }'
+
+    curl -X POST "$HARBOR_URL/api/v2.0/projects" \
+      -u "$HARBOR_USER:$HARBOR_PASSWORD" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "project_name": "training-images",
+        "public": false,
+        "metadata": {
+          "auto_scan": "true"
+        }
+      }'
+
+    curl -X POST "$HARBOR_URL/api/v2.0/projects" \
+      -u "$HARBOR_USER:$HARBOR_PASSWORD" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "project_name": "serving-images",
+        "public": false,
+        "metadata": {
+          "auto_scan": "true",
+          "severity": "critical"
+        }
+      }'
+
+    echo "Harbor projects created!"
+
+---
+# Job to initialize projects
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: harbor-init-projects
+  namespace: harbor
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: curlimages/curl:latest
+          command: [sh, /scripts/init-projects.sh]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: harbor-projects-init
+            defaultMode: 0755
+
+---
+# Robot account for CI/CD pipelines
+# Create via Harbor UI:
+# 1. Go to project "ml-models"
+# 2. Robot Accounts → New Robot Account
+# 3. Name: pipeline-pusher
+# 4. Permissions: Push artifact, Pull artifact
+# 5. Save token for use in CI/CD
+
+---
+# Replication policy (multi-region DR)
+# Example: Replicate ml-models from us-west to us-east
+# Configure via Harbor UI:
+# 1. Administration → Replications → New Replication Rule
+# 2. Name: us-west-to-us-east
+# 3. Source: harbor.us-west.example.com/ml-models
+# 4. Destination: harbor.us-east.example.com/ml-models
+# 5. Trigger: Event Based (push)
+
+---
+# Quick install commands:
+#
+# 1. Install Harbor with Helm:
+# helm repo add harbor https://helm.goharbor.io
+# helm repo update
+# helm install harbor harbor/harbor \
+#   --namespace harbor \
+#   --create-namespace \
+#   --set expose.type=loadBalancer \
+#   --set persistence.enabled=true \
+#   --set persistence.persistentVolumeClaim.registry.size=500Gi \
+#   --set harborAdminPassword="$(openssl rand -base64 32)" \  # ⚠️ Generate strong password
+#   --set externalURL=https://harbor.ml-platform.example.com
+#
+# 2. Get Harbor URL:
+# kubectl get svc -n harbor harbor
+#
+# 3. Login to Harbor:
+# docker login harbor.ml-platform.example.com
+# Username: admin
+# Password: <use-the-password-from-step-1>
+#
+# 4. Push model container:
+# docker tag my-model:v1 harbor.ml-platform.example.com/ml-models/my-model:v1
+# docker push harbor.ml-platform.example.com/ml-models/my-model:v1
+#
+# 5. View in Harbor UI:
+# Open https://harbor.ml-platform.example.com
+# Go to Projects → ml-models → Repositories
+
+---
+# Harbor for ML use cases:
+#
+# 1. Model Containers:
+#    - Store trained model + serving code
+#    - Tag: model-name:version (e.g., llama2-13b:v1.2.3)
+#    - Vulnerability scan before deployment
+#
+# 2. Training Job Containers:
+#    - Base images for PyTorch/TensorFlow
+#    - Custom training code
+#    - Versioned and scanned
+#
+# 3. OCI Artifacts (with KitOps):
+#    - Model weights as OCI artifacts
+#    - Dataset snapshots
+#    - Model cards and metadata
+#
+# 4. Multi-tenancy:
+#    - Projects per team (team-a/models, team-b/models)
+#    - RBAC per project
+#    - Quota management
+#
+# 5. Security:
+#    - Trivy vulnerability scanning
+#    - Notary image signing
+#    - Webhook notifications on CVEs
+#
+# 6. Cost optimization:
+#    - Tag retention policies (keep last 10 versions)
+#    - Garbage collection (remove unused layers)
+#    - Compression and deduplication
+#
+# Production best practices:
+# - Use Ingress with TLS (not LoadBalancer)
+# - Enable Notary for image signing
+# - Configure OIDC/LDAP authentication
+# - Set up replication for DR
+# - Enable audit logging
+# - Configure resource quotas per project
+# - Regular vulnerability scans
+# - Automated garbage collection

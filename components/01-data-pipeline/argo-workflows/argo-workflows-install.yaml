@@ -1,0 +1,369 @@
+# ABOUTME: Argo Workflows installation for ML data pipeline orchestration
+# ABOUTME: Provides DAG-based workflow execution with Kubernetes-native artifact passing
+
+---
+# Namespace for Argo Workflows
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argo
+  labels:
+    app: argo-workflows
+
+---
+# Install Argo Workflows using kubectl:
+# kubectl apply -n argo -f https://github.com/argoproj/argo-workflows/releases/download/v3.5.5/install.yaml
+#
+# Or apply this custom configuration with specific settings:
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-workflow
+  namespace: argo
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-server
+  namespace: argo
+
+---
+# ClusterRole for Argo Workflow Controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argo-workflow-controller
+rules:
+  # Workflow management
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - pods/log
+      - pods/exec
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - secrets
+    verbs:
+      - get
+      - watch
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - create
+      - delete
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - workflows
+      - workflows/finalizers
+      - workflowtemplates
+      - workflowtemplates/finalizers
+      - cronworkflows
+      - cronworkflows/finalizers
+      - clusterworkflowtemplates
+      - clusterworkflowtemplates/finalizers
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+      - delete
+      - create
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - workflowtasksets
+      - workflowtasksets/finalizers
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+      - delete
+      - create
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-workflow-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-workflow-controller
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflow
+    namespace: argo
+
+---
+# ConfigMap for Argo Workflow Controller
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workflow-controller-configmap
+  namespace: argo
+data:
+  # Artifact repository (S3-compatible for ML artifacts)
+  artifactRepository: |
+    s3:
+      bucket: ml-pipeline-artifacts
+      endpoint: s3.amazonaws.com
+      region: us-west-2
+      insecure: false
+      # Use IAM roles for pods (no hardcoded credentials)
+      useSDKCreds: true
+
+  # Workflow defaults
+  workflowDefaults: |
+    spec:
+      # Default TTL for workflow cleanup (7 days)
+      ttlStrategy:
+        secondsAfterCompletion: 604800
+      # Pod garbage collection
+      podGC:
+        strategy: OnPodCompletion
+        deleteDelayDuration: 600s
+
+  # Resource quotas per workflow
+  resourceRateLimit: |
+    limit: 50
+    burst: 100
+
+  # Enable Prometheus metrics
+  metricsConfig: |
+    enabled: true
+    path: /metrics
+    port: 9090
+
+---
+# Argo Workflow Controller Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflow-controller
+  namespace: argo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: workflow-controller
+  template:
+    metadata:
+      labels:
+        app: workflow-controller
+    spec:
+      serviceAccountName: argo-workflow
+      containers:
+        - name: workflow-controller
+          image: quay.io/argoproj/workflow-controller:v3.5.5
+          args:
+            - --configmap
+            - workflow-controller-configmap
+            - --executor-image
+            - quay.io/argoproj/argoexec:v3.5.5
+            - --namespaced
+            - --managed-namespace
+            - argo
+          env:
+            - name: LEADER_ELECTION_IDENTITY
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: "0.5"
+            limits:
+              memory: 1Gi
+              cpu: "1"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 6060
+            initialDelaySeconds: 90
+            periodSeconds: 60
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+---
+# Argo Server Deployment (UI and API)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argo-server
+  namespace: argo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: argo-server
+  template:
+    metadata:
+      labels:
+        app: argo-server
+    spec:
+      serviceAccountName: argo-server
+      containers:
+        - name: argo-server
+          image: quay.io/argoproj/argocli:v3.5.5
+          args:
+            - server
+            - --namespaced
+            - --managed-namespace
+            - argo
+            - --auth-mode
+            - server  # Use server auth (not SSO for demo)
+          ports:
+            - containerPort: 2746
+              name: web
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: "0.25"
+            limits:
+              memory: 512Mi
+              cpu: "0.5"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 2746
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 2746
+              scheme: HTTPS
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+---
+# Service for Argo Server UI
+apiVersion: v1
+kind: Service
+metadata:
+  name: argo-server
+  namespace: argo
+spec:
+  type: LoadBalancer  # Change to ClusterIP for production with Ingress
+  ports:
+    - port: 2746
+      targetPort: 2746
+      name: web
+  selector:
+    app: argo-server
+
+---
+# ServiceMonitor for Prometheus (workflow metrics)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: argo-workflows-metrics
+  namespace: argo
+  labels:
+    app: argo-workflows
+spec:
+  selector:
+    matchLabels:
+      app: workflow-controller
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+
+---
+# Service for Workflow Controller metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: workflow-controller-metrics
+  namespace: argo
+  labels:
+    app: workflow-controller
+spec:
+  ports:
+    - port: 9090
+      targetPort: 9090
+      name: metrics
+  selector:
+    app: workflow-controller
+
+---
+# RBAC for submitting workflows (for ML training jobs)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: workflow-submitter
+  namespace: argo
+rules:
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - workflows
+      - workflowtemplates
+      - cronworkflows
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workflow-submitter
+  namespace: argo
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workflow-submitter
+  namespace: argo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: workflow-submitter
+subjects:
+  - kind: ServiceAccount
+    name: workflow-submitter
+    namespace: argo
+
+---
+# Quick install commands:
+# kubectl create namespace argo
+# kubectl apply -n argo -f https://github.com/argoproj/argo-workflows/releases/download/v3.5.5/install.yaml
+# kubectl apply -f components/01-data-pipeline/argo-workflows/argo-workflows-install.yaml -n argo
+#
+# Access UI:
+# kubectl -n argo port-forward svc/argo-server 2746:2746
+# Open https://localhost:2746

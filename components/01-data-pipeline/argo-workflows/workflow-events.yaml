@@ -1,0 +1,369 @@
+# ABOUTME: Event-driven workflow triggers for ML data pipeline automation
+# ABOUTME: Kafka event sources, S3 notifications, and retraining triggers for automated MLOps
+
+---
+# EventSource: Kafka topic events
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: kafka-event-source
+  namespace: argo
+spec:
+  kafka:
+    # Trigger on new raw data
+    raw-data-events:
+      url: ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+      topic: ml-raw-data
+      partition: "0"  # Listen to partition 0 (can be replicated for all partitions)
+      consumerGroup:
+        groupName: argo-workflow-triggers
+        oldest: false  # Start from latest
+      jsonBody: true
+      tls:
+        insecureSkipVerify: true
+
+    # Trigger on retrain requests
+    retrain-triggers:
+      url: ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+      topic: ml-retrain-triggers
+      partition: "0"
+      consumerGroup:
+        groupName: argo-retrain-triggers
+        oldest: false
+      jsonBody: true
+
+    # Trigger on data quality alerts
+    quality-alerts:
+      url: ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+      topic: ml-data-quality
+      partition: "0"
+      consumerGroup:
+        groupName: argo-quality-triggers
+        oldest: false
+      jsonBody: true
+
+---
+# EventSource: Webhook for external triggers
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: webhook-event-source
+  namespace: argo
+spec:
+  service:
+    ports:
+      - port: 12000
+        targetPort: 12000
+  webhook:
+    # Trigger preprocessing via HTTP POST
+    preprocessing-trigger:
+      port: "12000"
+      endpoint: /preprocessing
+      method: POST
+
+    # Trigger training via HTTP POST
+    training-trigger:
+      port: "12000"
+      endpoint: /training
+      method: POST
+
+---
+# Sensor: Process raw data events
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: raw-data-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: raw-data-event
+      eventSourceName: kafka-event-source
+      eventName: raw-data-events
+      filters:
+        data:
+          # Only trigger if batch size threshold reached
+          - path: body.record_count
+            type: number
+            value:
+              - "1000"
+            comparator: ">="
+
+  triggers:
+    - template:
+        name: trigger-preprocessing
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: auto-preprocessing-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: data-preprocessing-pipeline
+                arguments:
+                  parameters:
+                    - name: triggered-by
+                      value: "kafka-event"
+                    - name: event-timestamp
+                      value: "{{dependencies.raw-data-event.body.timestamp}}"
+
+---
+# Sensor: Retraining triggers
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: retrain-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: retrain-event
+      eventSourceName: kafka-event-source
+      eventName: retrain-triggers
+      filters:
+        data:
+          # Only trigger if confidence threshold drops
+          - path: body.model_accuracy
+            type: number
+            value:
+              - "0.85"
+            comparator: "<"
+
+  triggers:
+    - template:
+        name: trigger-retraining
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: auto-retrain-
+                namespace: argo
+                labels:
+                  trigger: retraining
+                  reason: accuracy-drop
+              spec:
+                entrypoint: retrain-pipeline
+                templates:
+                  - name: retrain-pipeline
+                    dag:
+                      tasks:
+                        # Step 1: Fetch latest data
+                        - name: fetch-data
+                          template: fetch-training-data
+
+                        # Step 2: Preprocess
+                        - name: preprocess
+                          dependencies: [fetch-data]
+                          templateRef:
+                            name: data-preprocessing-pipeline
+                            template: preprocessing-dag
+
+                        # Step 3: Trigger training (placeholder)
+                        - name: train-model
+                          dependencies: [preprocess]
+                          template: placeholder-training
+
+                  - name: fetch-training-data
+                    container:
+                      image: python:3.11-slim
+                      command: [echo]
+                      args: ["Fetching training data from Kafka..."]
+
+                  - name: placeholder-training
+                    container:
+                      image: python:3.11-slim
+                      command: [echo]
+                      args: ["Training model (placeholder)..."]
+
+---
+# Sensor: Data quality alerts
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: quality-alert-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: quality-alert
+      eventSourceName: kafka-event-source
+      eventName: quality-alerts
+      filters:
+        data:
+          # Only trigger on high/critical severity
+          - path: body.severity
+            type: string
+            value:
+              - "high"
+              - "critical"
+
+  triggers:
+    # Trigger 1: Run validation workflow
+    - template:
+        name: validate-data
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: quality-validation-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: data-validation-pipeline
+
+    # Trigger 2: Send notification (placeholder for Slack/PagerDuty integration)
+    - template:
+        name: send-notification
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                generateName: quality-alert-
+                namespace: argo
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: notify
+                    image: curlimages/curl:latest
+                    command:
+                      - sh
+                      - -c
+                      - |
+                        # Placeholder for Slack webhook
+                        echo "🚨 Data quality alert: {{dependencies.quality-alert.body.message}}"
+                        # curl -X POST -H 'Content-type: application/json' \
+                        #   --data '{"text":"Data quality alert"}' \
+                        #   $SLACK_WEBHOOK_URL
+
+---
+# Sensor: Webhook-triggered workflows
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: webhook-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: preprocessing-webhook
+      eventSourceName: webhook-event-source
+      eventName: preprocessing-trigger
+
+  triggers:
+    - template:
+        name: run-preprocessing
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: webhook-preprocessing-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: data-preprocessing-pipeline
+                arguments:
+                  parameters:
+                    - name: triggered-by
+                      value: "webhook"
+                    - name: webhook-payload
+                      value: "{{dependencies.preprocessing-webhook.body}}"
+
+---
+# CronWorkflow: Scheduled data pipeline runs
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: daily-preprocessing
+  namespace: argo
+spec:
+  schedule: "0 2 * * *"  # Run at 2 AM UTC daily
+  timezone: "UTC"
+  concurrencyPolicy: Forbid  # Don't overlap runs
+  startingDeadlineSeconds: 3600  # Start within 1 hour if delayed
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 10
+  workflowSpec:
+    workflowTemplateRef:
+      name: data-preprocessing-pipeline
+    arguments:
+      parameters:
+        - name: triggered-by
+          value: "cron-schedule"
+
+---
+# CronWorkflow: Weekly data validation
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: weekly-validation
+  namespace: argo
+spec:
+  schedule: "0 0 * * 0"  # Run at midnight every Sunday
+  timezone: "UTC"
+  concurrencyPolicy: Forbid
+  workflowSpec:
+    workflowTemplateRef:
+      name: data-validation-pipeline
+    arguments:
+      artifacts:
+        - name: dataset
+          s3:
+            key: "datasets/current/latest.parquet"
+        - name: reference-dataset
+          s3:
+            key: "datasets/reference/baseline.parquet"
+
+---
+# Service for webhook event source
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-eventsource-svc
+  namespace: argo
+spec:
+  type: LoadBalancer  # Change to ClusterIP with Ingress for production
+  ports:
+    - port: 12000
+      targetPort: 12000
+      name: webhook
+  selector:
+    eventsource-name: webhook-event-source
+
+---
+# Example: Manual trigger via kubectl
+# kubectl create -f - <<EOF
+# apiVersion: argoproj.io/v1alpha1
+# kind: Workflow
+# metadata:
+#   generateName: manual-preprocessing-
+#   namespace: argo
+# spec:
+#   workflowTemplateRef:
+#     name: data-preprocessing-pipeline
+# EOF
+
+# Example: Trigger via webhook
+# curl -X POST http://<webhook-service-ip>:12000/preprocessing \
+#   -H 'Content-Type: application/json' \
+#   -d '{"dataset": "customer-events", "batch_size": 1000}'
+
+# Example: Publish retrain trigger to Kafka
+# kubectl run -it --rm kafka-producer --image=quay.io/strimzi/kafka:latest-kafka-3.7.0 --restart=Never -- \
+#   bin/kafka-console-producer.sh \
+#   --bootstrap-server ml-data-cluster-kafka-bootstrap:9092 \
+#   --topic ml-retrain-triggers \
+#   <<EOF
+# {"model_name": "fraud-detector", "model_accuracy": 0.82, "threshold": 0.85}
+# EOF

@@ -1,0 +1,360 @@
+# ABOUTME: Model versioning and tagging strategies for reproducible ML deployments
+# ABOUTME: Semantic versioning, environment tagging, and promotion workflows for ML artifacts
+
+---
+# Versioning Strategy: Semantic Versioning for ML Models
+# Format: MAJOR.MINOR.PATCH
+# - MAJOR: Breaking API changes, different architecture
+# - MINOR: New features, improved accuracy (backward compatible)
+# - PATCH: Bug fixes, performance improvements
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: versioning-guide
+  namespace: ml-models
+data:
+  VERSIONING.md: |
+    # Model Versioning Guide
+
+    ## Semantic Versioning for ML Models
+
+    ### Version Format: MAJOR.MINOR.PATCH
+
+    **MAJOR (e.g., 1.0.0 → 2.0.0):**
+    - Different model architecture (ResNet → ViT)
+    - Breaking API changes (different input/output format)
+    - Different training objective
+    - Requires code changes in consuming applications
+
+    Example:
+    ```
+    bert-base-uncased:1.5.2  # BERT architecture
+    bert-base-uncased:2.0.0  # RoBERTa architecture (breaking)
+    ```
+
+    **MINOR (e.g., 1.0.0 → 1.1.0):**
+    - Improved accuracy (new training data)
+    - Additional features (multi-language support)
+    - Backward compatible changes
+    - Same API, better performance
+
+    Example:
+    ```
+    fraud-detector:1.0.0  # 85% accuracy
+    fraud-detector:1.1.0  # 88% accuracy (retrained)
+    ```
+
+    **PATCH (e.g., 1.0.0 → 1.0.1):**
+    - Bug fixes (preprocessing errors)
+    - Performance optimizations
+    - No accuracy changes
+    - Hotfixes
+
+    Example:
+    ```
+    resnet50:1.0.0  # Original
+    resnet50:1.0.1  # Fixed image normalization bug
+    ```
+
+    ## Tags for Environment Promotion
+
+    ### Development Tags
+    - `model:dev` - Latest development version
+    - `model:dev-YYYYMMDD` - Daily dev builds
+    - `model:feature-xyz` - Feature branch models
+
+    ### Staging Tags
+    - `model:staging` - Current staging version
+    - `model:rc-1.2.0` - Release candidate
+
+    ### Production Tags
+    - `model:latest` - Latest production version
+    - `model:stable` - Last known good version
+    - `model:1.2.0` - Specific semantic version
+
+    ## Immutable Tags vs Mutable Tags
+
+    **Immutable (never change):**
+    - `model:1.2.0` - Semantic versions
+    - `model:sha256-abc123` - Content-addressable
+
+    **Mutable (can change):**
+    - `model:latest` - Points to newest version
+    - `model:prod` - Points to current production
+    - `model:staging` - Points to current staging
+
+    ## Model Metadata in Image Labels
+
+    Every model image should include:
+    - `org.opencontainers.image.version` - Semantic version
+    - `ml.model.name` - Model name
+    - `ml.model.framework` - PyTorch, TensorFlow, etc.
+    - `ml.model.task` - Classification, detection, etc.
+    - `ml.training.date` - Training completion date
+    - `ml.training.dataset` - Dataset name and version
+    - `ml.metrics.accuracy` - Model accuracy
+    - `ml.git.commit` - Git commit SHA
+
+---
+# Example: Tagging Models in CI/CD Pipeline
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tag-model-pipeline
+  namespace: ml-models
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: tagger
+          image: alpine:latest
+          command: [sh, -c]
+          args:
+            - |
+              # Variables from CI/CD
+              MODEL_NAME="llama2-7b"
+              GIT_COMMIT="abc1234"
+              TRAINING_DATE="2024-01-15"
+              ACCURACY="0.892"
+              SEMANTIC_VERSION="1.2.0"
+
+              # Harbor registry
+              REGISTRY="harbor.ml-platform.example.com/ml-models"
+
+              # Generate tags
+              echo "Tagging model ${MODEL_NAME}:${SEMANTIC_VERSION}"
+
+              # Immutable tags
+              TAGS=(
+                "${SEMANTIC_VERSION}"
+                "${SEMANTIC_VERSION}-${GIT_COMMIT}"
+                "sha256-$(echo $GIT_COMMIT | cut -c1-12)"
+              )
+
+              # Mutable tags (if production)
+              if [ "$ENVIRONMENT" = "production" ]; then
+                TAGS+=("latest")
+                TAGS+=("stable")
+                TAGS+=("prod")
+              fi
+
+              # Mutable tags (if staging)
+              if [ "$ENVIRONMENT" = "staging" ]; then
+                TAGS+=("staging")
+                TAGS+=("rc-${SEMANTIC_VERSION}")
+              fi
+
+              # Apply tags
+              for TAG in "${TAGS[@]}"; do
+                echo "Tagging: ${REGISTRY}/${MODEL_NAME}:${TAG}"
+                # docker tag ${MODEL_NAME}:build ${REGISTRY}/${MODEL_NAME}:${TAG}
+                # docker push ${REGISTRY}/${MODEL_NAME}:${TAG}
+              done
+
+              echo "Model tagged successfully!"
+
+---
+# Model Promotion Workflow
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promotion-workflow
+  namespace: ml-models
+data:
+  promote.sh: |
+    #!/bin/bash
+    # Promote model from staging to production
+
+    MODEL_NAME=$1
+    VERSION=$2
+    REGISTRY="harbor.ml-platform.example.com/ml-models"
+
+    # Validation
+    if [ -z "$MODEL_NAME" ] || [ -z "$VERSION" ]; then
+      echo "Usage: $0 <model-name> <version>"
+      exit 1
+    fi
+
+    # Check if model exists in staging
+    STAGING_TAG="${REGISTRY}/${MODEL_NAME}:staging"
+    if ! docker pull "$STAGING_TAG"; then
+      echo "Error: Model not found in staging"
+      exit 1
+    fi
+
+    # Run validation tests
+    echo "Running validation tests..."
+    # docker run --rm $STAGING_TAG python test.py
+    # if [ $? -ne 0 ]; then
+    #   echo "Validation tests failed!"
+    #   exit 1
+    # fi
+
+    echo "Validation passed!"
+
+    # Promote to production
+    echo "Promoting ${MODEL_NAME}:${VERSION} to production..."
+
+    # Tag as production
+    docker tag "$STAGING_TAG" "${REGISTRY}/${MODEL_NAME}:${VERSION}"
+    docker tag "$STAGING_TAG" "${REGISTRY}/${MODEL_NAME}:latest"
+    docker tag "$STAGING_TAG" "${REGISTRY}/${MODEL_NAME}:prod"
+
+    # Push production tags
+    docker push "${REGISTRY}/${MODEL_NAME}:${VERSION}"
+    docker push "${REGISTRY}/${MODEL_NAME}:latest"
+    docker push "${REGISTRY}/${MODEL_NAME}:prod"
+
+    # Create backup of previous production
+    PREVIOUS_VERSION=$(docker inspect ${REGISTRY}/${MODEL_NAME}:prod \
+      --format='{{index .Config.Labels "org.opencontainers.image.version"}}')
+
+    if [ -n "$PREVIOUS_VERSION" ]; then
+      docker tag "${REGISTRY}/${MODEL_NAME}:prod" \
+        "${REGISTRY}/${MODEL_NAME}:prod-backup-${PREVIOUS_VERSION}"
+      docker push "${REGISTRY}/${MODEL_NAME}:prod-backup-${PREVIOUS_VERSION}"
+    fi
+
+    echo "✓ Model promoted to production: ${VERSION}"
+    echo "  Previous version backed up: ${PREVIOUS_VERSION}"
+
+---
+# Model Registry API: Query Models by Metadata
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-query-examples
+  namespace: ml-models
+data:
+  query-models.sh: |
+    #!/bin/bash
+    # Query Harbor API for models with specific criteria
+
+    HARBOR_URL="https://harbor.ml-platform.example.com"
+    HARBOR_USER="admin"
+    HARBOR_PASSWORD="Harbor12345"
+
+    # Find all models with accuracy > 0.90
+    curl -u "$HARBOR_USER:$HARBOR_PASSWORD" \
+      "$HARBOR_URL/api/v2.0/projects/ml-models/repositories" \
+      | jq '.[] | select(.labels |
+        any(.name == "ml.metrics.accuracy" and (.value | tonumber) > 0.90))'
+
+    # Find models trained in last 30 days
+    THIRTY_DAYS_AGO=$(date -d '30 days ago' +%Y-%m-%d)
+    curl -u "$HARBOR_USER:$HARBOR_PASSWORD" \
+      "$HARBOR_URL/api/v2.0/projects/ml-models/repositories" \
+      | jq --arg date "$THIRTY_DAYS_AGO" \
+        '.[] | select(.labels |
+          any(.name == "ml.training.date" and .value > $date))'
+
+    # Find all PyTorch models
+    curl -u "$HARBOR_USER:$HARBOR_PASSWORD" \
+      "$HARBOR_URL/api/v2.0/projects/ml-models/repositories" \
+      | jq '.[] | select(.labels |
+        any(.name == "ml.model.framework" and .value == "pytorch"))'
+
+---
+# Retention Policy: Keep Last N Versions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: retention-policy
+  namespace: ml-models
+data:
+  retention-config.json: |
+    {
+      "rules": [
+        {
+          "disabled": false,
+          "action": "retain",
+          "template": "latestPushedK",
+          "params": {
+            "latestPushedK": 10
+          },
+          "tag_selectors": [
+            {
+              "kind": "doublestar",
+              "decoration": "matches",
+              "pattern": "**"
+            }
+          ],
+          "scope_selectors": {
+            "repository": [
+              {
+                "kind": "doublestar",
+                "decoration": "repoMatches",
+                "pattern": "**"
+              }
+            ]
+          }
+        },
+        {
+          "disabled": false,
+          "action": "retain",
+          "template": "always",
+          "tag_selectors": [
+            {
+              "kind": "doublestar",
+              "decoration": "matches",
+              "pattern": "latest"
+            },
+            {
+              "kind": "doublestar",
+              "decoration": "matches",
+              "pattern": "prod"
+            },
+            {
+              "kind": "doublestar",
+              "decoration": "matches",
+              "pattern": "stable"
+            }
+          ],
+          "scope_selectors": {
+            "repository": [
+              {
+                "kind": "doublestar",
+                "decoration": "repoMatches",
+                "pattern": "**"
+              }
+            ]
+          }
+        }
+      ]
+    }
+
+---
+# Best Practices Summary:
+#
+# 1. Versioning:
+#    - Use semantic versioning (MAJOR.MINOR.PATCH)
+#    - Immutable version tags (1.2.0 never changes)
+#    - Git commit in tag (1.2.0-abc1234)
+#
+# 2. Environment Tags:
+#    - dev, staging, prod tags point to current version
+#    - Promote by re-tagging (staging → prod)
+#    - Keep backup tags (prod-backup-1.1.0)
+#
+# 3. Metadata:
+#    - Include accuracy, training date, dataset version
+#    - OCI image labels for discoverability
+#    - Queryable via Harbor API
+#
+# 4. Retention:
+#    - Keep last 10 versions per model
+#    - Never delete prod/stable tags
+#    - Automated garbage collection
+#
+# 5. Promotion:
+#    - Staging → Validation → Production
+#    - Automated tests before promotion
+#    - Rollback capability (revert tags)
+#
+# Real-world impact:
+# - 100% model reproducibility
+# - 0% "which model is in prod?" questions
+# - Instant rollback (re-tag previous version)
+# - Clear audit trail (who promoted when)

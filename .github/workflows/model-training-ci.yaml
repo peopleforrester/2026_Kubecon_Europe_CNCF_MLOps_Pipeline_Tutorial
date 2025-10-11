@@ -1,0 +1,426 @@
+# ABOUTME: GitHub Actions workflow for automated ML model training with testing and validation
+# ABOUTME: Triggers on code changes to training scripts, runs tests, trains model, and validates metrics
+
+name: Model Training CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'models/**'
+      - 'training/**'
+      - '.github/workflows/model-training-ci.yaml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'models/**'
+      - 'training/**'
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Model to train'
+        required: true
+        default: 'resnet50'
+      experiment_id:
+        description: 'Experiment ID'
+        required: false
+
+env:
+  REGISTRY: harbor.ml-platform.example.com
+  MODEL_REGISTRY: harbor.ml-platform.example.com/ml-models
+  KUBECONFIG_SECRET: ${{ secrets.KUBECONFIG }}
+
+jobs:
+  # Job 1: Validate code and run tests
+  validate:
+    name: Validate Training Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r training/requirements.txt
+          pip install pytest pytest-cov flake8 mypy
+
+      - name: Lint with flake8
+        run: |
+          flake8 training/ models/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 training/ models/ --count --max-complexity=10 --max-line-length=100 --statistics
+
+      - name: Type check with mypy
+        run: |
+          mypy training/ models/ --ignore-missing-imports
+
+      - name: Run unit tests
+        run: |
+          pytest training/tests/ -v --cov=training --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-training
+
+      - name: Validate training data
+        run: |
+          python training/scripts/validate_data.py \
+            --data-path=data/training \
+            --schema=schemas/training_schema.json
+
+  # Job 2: Build training container image
+  build-image:
+    name: Build Training Image
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/ml-training/trainer
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push training image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./training
+          file: ./training/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PYTHON_VERSION=3.11
+            CUDA_VERSION=12.1
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/ml-training/trainer:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Job 3: Submit training job to Kubernetes
+  submit-training:
+    name: Submit Training Job
+    runs-on: ubuntu-latest
+    needs: build-image
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Set training job name
+        id: job_name
+        run: |
+          MODEL_NAME="${{ github.event.inputs.model_name || 'resnet50' }}"
+          TIMESTAMP=$(date +%s)
+          JOB_NAME="${MODEL_NAME}-${GITHUB_SHA:0:7}-${TIMESTAMP}"
+          echo "job_name=${JOB_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Submit Volcano training job
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch.volcano.sh/v1alpha1
+          kind: Job
+          metadata:
+            name: ${{ steps.job_name.outputs.job_name }}
+            namespace: ml-training
+            labels:
+              team: ml-team
+              project: training-pipeline
+              environment: staging
+              model: ${{ github.event.inputs.model_name || 'resnet50' }}
+              git-sha: ${{ github.sha }}
+              triggered-by: github-actions
+          spec:
+            minAvailable: 2
+            schedulerName: volcano
+            queue: ml-training-queue
+            tasks:
+              - replicas: 2
+                name: worker
+                template:
+                  metadata:
+                    labels:
+                      team: ml-team
+                      project: training-pipeline
+                      environment: staging
+                  spec:
+                    restartPolicy: OnFailure
+                    containers:
+                      - name: trainer
+                        image: ${{ needs.build-image.outputs.image_tag }}
+                        command:
+                          - python
+                          - train.py
+                          - --model=${{ github.event.inputs.model_name || 'resnet50' }}
+                          - --epochs=10
+                          - --batch-size=32
+                          - --distributed
+                          - --experiment-id=${{ github.event.inputs.experiment_id || github.run_id }}
+                        resources:
+                          requests:
+                            cpu: 4
+                            memory: 16Gi
+                            nvidia.com/gpu: 1
+                          limits:
+                            cpu: 8
+                            memory: 32Gi
+                            nvidia.com/gpu: 1
+                        env:
+                          - name: GITHUB_SHA
+                            value: ${{ github.sha }}
+                          - name: GITHUB_REF
+                            value: ${{ github.ref }}
+                          - name: GITHUB_RUN_ID
+                            value: ${{ github.run_id }}
+          EOF
+
+      - name: Wait for training job to start
+        run: |
+          kubectl wait --for=condition=running \
+            pod -l job-name=${{ steps.job_name.outputs.job_name }} \
+            -n ml-training \
+            --timeout=10m
+
+      - name: Stream training logs
+        run: |
+          kubectl logs -f \
+            -l job-name=${{ steps.job_name.outputs.job_name }} \
+            -n ml-training \
+            --tail=100 || true
+
+      - name: Check training job status
+        run: |
+          STATUS=$(kubectl get job ${{ steps.job_name.outputs.job_name }} \
+            -n ml-training \
+            -o jsonpath='{.status.state.phase}')
+
+          echo "Training job status: $STATUS"
+
+          if [ "$STATUS" != "Completed" ]; then
+            echo "Training job failed or is still running"
+            kubectl describe job ${{ steps.job_name.outputs.job_name }} -n ml-training
+            exit 1
+          fi
+
+  # Job 4: Validate model metrics
+  validate-model:
+    name: Validate Model Metrics
+    runs-on: ubuntu-latest
+    needs: submit-training
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install mlflow requests pandas numpy
+
+      - name: Fetch model metrics from MLflow
+        id: metrics
+        run: |
+          python - <<'PYTHON'
+          import mlflow
+          import os
+          import json
+
+          # Connect to MLflow
+          mlflow.set_tracking_uri("http://mlflow.ml-platform.example.com")
+
+          # Get experiment
+          experiment = mlflow.get_experiment_by_name("training-pipeline")
+
+          # Get latest run
+          runs = mlflow.search_runs(
+              experiment_ids=[experiment.experiment_id],
+              filter_string=f"tags.github_sha = '{os.environ['GITHUB_SHA']}'",
+              order_by=["start_time DESC"],
+              max_results=1
+          )
+
+          if runs.empty:
+              print("No runs found for this commit")
+              exit(1)
+
+          # Extract metrics
+          accuracy = runs.iloc[0]['metrics.accuracy']
+          loss = runs.iloc[0]['metrics.loss']
+
+          print(f"Accuracy: {accuracy}")
+          print(f"Loss: {loss}")
+
+          # Export for GitHub Actions
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"accuracy={accuracy}\n")
+              f.write(f"loss={loss}\n")
+
+          # Validate thresholds
+          if accuracy < 0.85:
+              print(f"❌ Model accuracy {accuracy} below threshold 0.85")
+              exit(1)
+
+          print(f"✅ Model passed validation")
+          PYTHON
+
+      - name: Comment metrics on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Model Training Results
+
+              - **Accuracy**: ${{ steps.metrics.outputs.accuracy }}
+              - **Loss**: ${{ steps.metrics.outputs.loss }}
+              - **Commit**: ${{ github.sha }}
+              - **Training Job**: [View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+              ${steps.metrics.outputs.accuracy >= 0.85 ? '✅ Model passed validation' : '❌ Model below accuracy threshold'}
+              `
+            })
+
+  # Job 5: Register model in Harbor
+  register-model:
+    name: Register Model
+    runs-on: ubuntu-latest
+    needs: validate-model
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+      - name: Download model from training job
+        run: |
+          # Get model artifacts from persistent volume
+          POD=$(kubectl get pod -n ml-training \
+            -l git-sha=${{ github.sha }} \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          kubectl cp ml-training/$POD:/models/output ./model-artifacts/
+
+      - name: Package model with KitOps
+        run: |
+          # Create Modelkit
+          kitops pack \
+            --model-path=./model-artifacts/model.pt \
+            --name=${{ github.event.inputs.model_name || 'resnet50' }} \
+            --version=${{ github.sha }} \
+            --metadata=metadata.json
+
+      - name: Push model to Harbor
+        run: |
+          kitops push \
+            ${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name || 'resnet50' }}:${{ github.sha }}
+
+      - name: Tag as latest
+        run: |
+          kitops tag \
+            ${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name || 'resnet50' }}:${{ github.sha }} \
+            ${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name || 'resnet50' }}:latest
+
+      - name: Create GitHub release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: model-${{ github.event.inputs.model_name || 'resnet50' }}-${{ github.sha }}
+          release_name: Model ${{ github.event.inputs.model_name || 'resnet50' }} - ${{ github.sha }}
+          body: |
+            ## Model Training Complete
+
+            - **Model**: ${{ github.event.inputs.model_name || 'resnet50' }}
+            - **Accuracy**: ${{ needs.validate-model.outputs.accuracy }}
+            - **Registry**: ${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name || 'resnet50' }}:${{ github.sha }}
+            - **Training Job**: [View](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+# Workflow best practices:
+# 1. Gate progression: Each job depends on previous success
+# 2. Fast feedback: Validation runs first (< 5 minutes)
+# 3. Parallel execution: Build and test run concurrently when possible
+# 4. Caching: Docker layer cache, pip cache for speed
+# 5. Security: Vulnerability scanning, secret management
+# 6. Observability: Logs, metrics, GitHub comments
+# 7. Rollback: Keep previous versions for quick revert
+#
+# Typical execution time:
+# - Validate: 5 minutes
+# - Build image: 10 minutes (cached: 2 minutes)
+# - Submit training: 1 minute
+# - Training: 30-60 minutes (depends on model)
+# - Validate model: 2 minutes
+# - Register model: 5 minutes
+# Total: 45-75 minutes
+#
+# Cost optimization:
+# - Use GitHub-hosted runners for light tasks
+# - Use self-hosted GPU runners for training
+# - Cache dependencies and layers
+# - Skip training on docs-only changes

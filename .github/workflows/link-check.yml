@@ -1,0 +1,58 @@
+# ABOUTME: Link checking workflow for markdown documentation
+# ABOUTME: Validates internal file references and external URLs in all documentation
+name: Link Checking
+
+on:
+  push:
+    paths:
+      - '**.md'
+      - '**.markdown'
+      - 'scripts/check-links.sh'
+  pull_request:
+    paths:
+      - '**.md'
+      - '**.markdown'
+      - 'scripts/check-links.sh'
+  workflow_dispatch:
+  schedule:
+    # Run weekly on Wednesdays at 9 AM UTC
+    - cron: '0 9 * * 3'
+
+jobs:
+  link-check:
+    name: Check Links
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+
+      - name: Run link checker
+        run: |
+          chmod +x scripts/check-links.sh
+          ./scripts/check-links.sh
+
+      - name: Create link report
+        if: failure()
+        run: |
+          echo "## Link Check Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Broken links were detected. Please review the logs above." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Common Fixes:" >> $GITHUB_STEP_SUMMARY
+          echo "- Update relative paths if files were moved" >> $GITHUB_STEP_SUMMARY
+          echo "- Remove or replace broken external URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- Use archive.org for deprecated external resources" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify anchor links point to existing sections" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload link check results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: link-check-results
+          path: scripts/check-links.sh
+          retention-days: 7

@@ -1,0 +1,593 @@
+# ABOUTME: KServe autoscaling configurations for cost optimization and performance
+# ABOUTME: Demonstrates scale-to-zero, HPA, custom metrics, and GPU-aware autoscaling strategies
+
+---
+# Autoscaling Overview for KServe
+#
+# KServe uses Knative Autoscaler (KPA) by default, which provides:
+# 1. Scale to zero (save 80% cost on idle models)
+# 2. Fast scale-up (0 to 100 replicas in 30 seconds)
+# 3. Concurrency-based autoscaling (not CPU/memory)
+# 4. Panic mode (rapid scale-up under sudden load)
+#
+# Autoscaling modes:
+# - KPA (Knative Pod Autoscaler): Default, concurrency-based
+# - HPA (Horizontal Pod Autoscaler): CPU/memory/custom metrics
+#
+# Key metrics:
+# - Concurrency: Number of concurrent requests per pod
+# - RPS (Requests Per Second): Request rate
+# - CPU/Memory: Resource utilization
+# - Custom: GPU utilization, queue depth, latency
+#
+# Autoscaling strategies:
+# 1. Cost optimization: minScale=0, scale to zero
+# 2. Latency optimization: minScale>0, keep warm replicas
+# 3. High throughput: High target concurrency, fast scale-up
+# 4. Bursty traffic: Panic mode, rapid scale-up
+
+---
+# Global Autoscaler Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-autoscaler
+  namespace: knative-serving
+data:
+  # Scale to zero configuration
+  enable-scale-to-zero: "true"
+  scale-to-zero-grace-period: "30s"
+  scale-to-zero-pod-retention-period: "0s"
+
+  # Stable window: Time to average metrics before scaling
+  stable-window: "60s"
+
+  # Panic window: Rapid scale-up under sudden load
+  panic-window-percentage: "10.0"  # 10% of stable window
+  panic-threshold-percentage: "200.0"  # Scale up if load > 2x target
+
+  # Tick interval: How often to check metrics
+  tick-interval: "2s"
+
+  # Max scale-up rate
+  max-scale-up-rate: "1000.0"  # Can scale up by 1000x
+  max-scale-down-rate: "2.0"   # Scale down slowly (max 2x per window)
+
+  # Target burst capacity
+  target-burst-capacity: "200"  # Extra capacity for bursts
+
+  # Activator capacity
+  activator-capacity: "100.0"  # Requests activator can handle
+
+  # Concurrency target defaults
+  container-concurrency-target-default: "100"
+  container-concurrency-target-percentage: "0.7"  # 70% of container concurrency
+
+  # Requests per second target (alternative to concurrency)
+  requests-per-second-target-default: "200"
+
+---
+# Example 1: Scale-to-zero (cost optimization)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: scale-to-zero-cost-optimized
+  namespace: ml-serving
+  annotations:
+    # Scale to zero after 60 seconds of inactivity
+    autoscaling.knative.dev/minScale: "0"
+    autoscaling.knative.dev/maxScale: "10"
+    autoscaling.knative.dev/scale-down-delay: "60s"
+    # Target 50 concurrent requests per pod
+    autoscaling.knative.dev/target: "50"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+
+---
+# Example 2: Always warm (latency optimization)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: always-warm-low-latency
+  namespace: ml-serving
+  annotations:
+    # Keep 3 replicas always warm
+    autoscaling.knative.dev/minScale: "3"
+    autoscaling.knative.dev/maxScale: "50"
+    # Target 100 concurrent requests per pod
+    autoscaling.knative.dev/target: "100"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/bert-base
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+
+---
+# Example 3: High concurrency (fast models)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: high-concurrency-fast-model
+  namespace: ml-serving
+  annotations:
+    autoscaling.knative.dev/minScale: "2"
+    autoscaling.knative.dev/maxScale: "100"
+    # ONNX models are fast, can handle high concurrency
+    autoscaling.knative.dev/target: "500"
+spec:
+  predictor:
+    onnx:
+      storageUri: s3://ml-models/onnx/mobilenet
+      resources:
+        requests:
+          cpu: "4"
+          memory: "4Gi"
+        limits:
+          cpu: "8"
+          memory: "8Gi"
+
+---
+# Example 4: Low concurrency (slow models)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: low-concurrency-slow-model
+  namespace: ml-serving
+  annotations:
+    autoscaling.knative.dev/minScale: "1"
+    autoscaling.knative.dev/maxScale: "20"
+    # Large LLM models are slow, low concurrency
+    autoscaling.knative.dev/target: "5"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/llama2-70b
+      resources:
+        requests:
+          cpu: "16"
+          memory: "128Gi"
+        limits:
+          cpu: "32"
+          memory: "256Gi"
+          nvidia.com/gpu: "4"  # 4 A100 GPUs for 70B model
+
+---
+# Example 5: RPS-based autoscaling (instead of concurrency)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: rps-based-autoscaling
+  namespace: ml-serving
+  annotations:
+    autoscaling.knative.dev/minScale: "1"
+    autoscaling.knative.dev/maxScale: "50"
+    # Target 200 requests per second per pod
+    autoscaling.knative.dev/metric: "rps"
+    autoscaling.knative.dev/target: "200"
+spec:
+  predictor:
+    tensorflow:
+      storageUri: s3://ml-models/tensorflow/inception-v3
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+
+---
+# Example 6: HPA with CPU utilization
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: hpa-cpu-based
+  namespace: ml-serving
+  annotations:
+    # Use HPA instead of KPA
+    autoscaling.knative.dev/class: "hpa.autoscaling.knative.dev"
+    autoscaling.knative.dev/metric: "cpu"
+    autoscaling.knative.dev/target: "80"  # Target 80% CPU utilization
+    autoscaling.knative.dev/minScale: "2"
+    autoscaling.knative.dev/maxScale: "20"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+
+---
+# Example 7: HPA with memory utilization
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: hpa-memory-based
+  namespace: ml-serving
+  annotations:
+    autoscaling.knative.dev/class: "hpa.autoscaling.knative.dev"
+    autoscaling.knative.dev/metric: "memory"
+    autoscaling.knative.dev/target: "70"  # Target 70% memory utilization
+    autoscaling.knative.dev/minScale: "1"
+    autoscaling.knative.dev/maxScale: "10"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/bert-large
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+
+---
+# Example 8: Custom metrics autoscaling (GPU utilization)
+# Requires Prometheus and custom metrics adapter
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: custom-metrics-config
+  namespace: ml-serving
+data:
+  gpu-utilization-query: |
+    # Prometheus query for GPU utilization
+    avg(
+      rate(DCGM_FI_DEV_GPU_UTIL[5m])
+      * on(pod) group_left(label_serving_kserve_io_inferenceservice)
+      kube_pod_labels{label_serving_kserve_io_inferenceservice="gpu-autoscaling-model"}
+    )
+
+---
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: gpu-autoscaling-model
+  namespace: ml-serving
+  annotations:
+    # Use external HPA for custom metrics
+    autoscaling.knative.dev/class: "external.autoscaling.knative.dev"
+    autoscaling.knative.dev/minScale: "1"
+    autoscaling.knative.dev/maxScale: "10"
+spec:
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/stable-diffusion
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "1"
+
+---
+# External HPA for GPU utilization
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gpu-autoscaling-model-hpa
+  namespace: ml-serving
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gpu-autoscaling-model-predictor-default
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: gpu_utilization
+          selector:
+            matchLabels:
+              inference_service: gpu-autoscaling-model
+        target:
+          type: Value
+          value: "70"  # Target 70% GPU utilization
+
+---
+# Example 9: Scheduled autoscaling (predictable traffic patterns)
+# Use CronJobs to adjust minScale based on time of day
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-up-business-hours
+  namespace: ml-serving
+spec:
+  # Scale up at 8 AM (Monday-Friday)
+  schedule: "0 8 * * 1-5"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:latest
+              command: [sh, -c]
+              args:
+                - |
+                  # Set minScale to 10 during business hours
+                  kubectl annotate inferenceservice scheduled-model \
+                    -n ml-serving \
+                    autoscaling.knative.dev/minScale=10 \
+                    --overwrite
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-down-off-hours
+  namespace: ml-serving
+spec:
+  # Scale down at 6 PM (Monday-Friday)
+  schedule: "0 18 * * 1-5"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: scaler
+              image: bitnami/kubectl:latest
+              command: [sh, -c]
+              args:
+                - |
+                  # Set minScale to 1 during off-hours
+                  kubectl annotate inferenceservice scheduled-model \
+                    -n ml-serving \
+                    autoscaling.knative.dev/minScale=1 \
+                    --overwrite
+
+---
+# Example 10: Queue-based autoscaling (for batch inference)
+# Scale based on message queue depth (Kafka, RabbitMQ, SQS)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: queue-autoscaling-config
+  namespace: ml-serving
+data:
+  kafka-lag-query: |
+    # Prometheus query for Kafka consumer lag
+    sum(kafka_consumergroup_lag{
+      consumergroup="ml-inference-consumer",
+      topic="ml-predictions"
+    })
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: queue-based-autoscaling-hpa
+  namespace: ml-serving
+spec:
+  scaleTargetRef:
+    apiVersion: serving.kserve.io/v1beta1
+    kind: InferenceService
+    name: batch-inference-model
+  minReplicas: 1
+  maxReplicas: 50
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_lag
+          selector:
+            matchLabels:
+              topic: ml-predictions
+        target:
+          type: AverageValue
+          averageValue: "100"  # Target 100 messages per pod
+
+---
+# Example 11: Multi-metric autoscaling
+# Scale based on multiple metrics (CPU + custom)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: multi-metric-hpa
+  namespace: ml-serving
+spec:
+  scaleTargetRef:
+    apiVersion: serving.kserve.io/v1beta1
+    kind: InferenceService
+    name: multi-metric-model
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    # Scale on CPU utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+    # Scale on custom metric (request latency)
+    - type: Pods
+      pods:
+        metric:
+          name: inference_latency_p99
+        target:
+          type: AverageValue
+          averageValue: "500"  # Keep p99 latency < 500ms
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 minutes before scaling down
+      policies:
+        - type: Percent
+          value: 50  # Scale down by max 50% at a time
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Scale up immediately
+      policies:
+        - type: Percent
+          value: 100  # Can double replicas
+          periodSeconds: 15
+        - type: Pods
+          value: 4  # Or add 4 pods
+          periodSeconds: 15
+      selectPolicy: Max  # Use the policy that scales faster
+
+---
+# Autoscaling Monitoring Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscaling-dashboard
+  namespace: ml-serving
+data:
+  dashboard.json: |
+    {
+      "dashboard": {
+        "title": "KServe Autoscaling Metrics",
+        "panels": [
+          {
+            "title": "Replica Count",
+            "targets": [
+              {
+                "expr": "kube_deployment_status_replicas{namespace=\"ml-serving\"}"
+              }
+            ]
+          },
+          {
+            "title": "Request Concurrency",
+            "targets": [
+              {
+                "expr": "revision_app_request_count{namespace=\"ml-serving\"}"
+              }
+            ]
+          },
+          {
+            "title": "Autoscaler Desired Pods",
+            "targets": [
+              {
+                "expr": "autoscaler_desired_pods{namespace=\"ml-serving\"}"
+              }
+            ]
+          },
+          {
+            "title": "Cold Start Count",
+            "targets": [
+              {
+                "expr": "rate(activator_request_count{response_code=\"200\",response_code_class=\"2xx\"}[5m])"
+              }
+            ]
+          },
+          {
+            "title": "Scale-to-Zero Events",
+            "targets": [
+              {
+                "expr": "autoscaler_actual_pods{namespace=\"ml-serving\"} == 0"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Best Practices Summary:
+#
+# 1. Choosing Autoscaling Strategy:
+#    Cost-sensitive (dev/test):
+#      - minScale: 0 (scale to zero)
+#      - target: 100-200 concurrency
+#      - Use KPA (Knative autoscaler)
+#
+#    Latency-sensitive (production):
+#      - minScale: 2-3 (avoid cold starts)
+#      - target: Based on model latency
+#      - Fast models (< 100ms): 200-500 concurrency
+#      - Slow models (> 1s): 5-20 concurrency
+#
+#    High throughput:
+#      - minScale: 5-10
+#      - maxScale: 100+
+#      - Enable panic mode for burst traffic
+#
+# 2. Setting Target Concurrency:
+#    Formula: target = (pod_cpu_limit / model_latency_seconds)
+#
+#    Example:
+#      - Model latency: 50ms (0.05s)
+#      - Pod has 4 CPUs
+#      - Target concurrency: 4 / 0.05 = 80
+#
+#    Add 30% safety margin: 80 * 0.7 = 56 target concurrency
+#
+# 3. GPU Autoscaling:
+#    - Use custom metrics (GPU utilization)
+#    - Target 70-80% GPU utilization
+#    - Consider GPU memory, not just utilization
+#    - Scale based on queue depth for batch inference
+#
+# 4. Monitoring:
+#    - Track: replica count, concurrency, request rate, latency
+#    - Alert on: high concurrency, scale-to-zero failures, cold starts
+#    - Dashboard: Grafana with Prometheus metrics
+#
+# 5. Tuning:
+#    - Start conservative (low target, high minScale)
+#    - Monitor for 1 week, collect metrics
+#    - Gradually increase target concurrency
+#    - Reduce minScale if cost is concern
+#    - Load test before production
+#
+# Real-world impact:
+# - Scale to zero: 80% cost reduction on idle models
+# - 0 to 100 replicas: 30 seconds (vs 5 minutes with HPA)
+# - Cold start latency: 2-5 seconds (first request after scale-to-zero)
+# - Warm start latency: < 100ms (subsequent requests)
+#
+# Cost analysis:
+# Without autoscaling:
+#   - 10 models * 24/7 * $0.50/hour = $3,600/month
+#
+# With scale-to-zero (20% utilization):
+#   - 10 models * 24/7 * 0.2 * $0.50/hour = $720/month
+#   - Savings: $2,880/month (80% reduction)
+#
+# Autoscaling timeline:
+# - Scale up: 5-10 seconds (new pod scheduled and ready)
+# - Scale down: 60-300 seconds (after stable window)
+# - Scale to zero: 60 seconds (after inactivity)
+# - Cold start: 2-5 seconds (model loading time)
+#
+# Common issues and solutions:
+# Issue: Frequent scale up/down (flapping)
+# Solution: Increase stable-window, add scale-down delay
+#
+# Issue: Cold starts too slow
+# Solution: Use minScale > 0, or optimize model loading
+#
+# Issue: Not scaling fast enough
+# Solution: Reduce stable-window, enable panic mode
+#
+# Issue: Scaling too aggressively
+# Solution: Increase target concurrency, add stabilization window

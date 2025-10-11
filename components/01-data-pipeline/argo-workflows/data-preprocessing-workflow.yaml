@@ -1,0 +1,490 @@
+# ABOUTME: Data preprocessing workflow for ML pipeline using Argo Workflows
+# ABOUTME: Reads from Kafka raw data topic, validates, preprocesses, writes to processed features topic
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: data-preprocessing-pipeline
+  namespace: argo
+  labels:
+    app: ml-data-pipeline
+    stage: preprocessing
+spec:
+  # Service account with Kafka access
+  serviceAccountName: workflow-submitter
+
+  # Workflow entrypoint
+  entrypoint: preprocessing-dag
+
+  # Volume for temporary data
+  volumeClaimTemplates:
+    - metadata:
+        name: workdir
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+
+  # Workflow templates
+  templates:
+    # DAG definition
+    - name: preprocessing-dag
+      dag:
+        tasks:
+          # Step 1: Fetch raw data from Kafka
+          - name: fetch-raw-data
+            template: fetch-from-kafka
+            arguments:
+              parameters:
+                - name: topic
+                  value: "ml-raw-data"
+                - name: consumer-group
+                  value: "preprocessing-pipeline"
+
+          # Step 2: Validate data quality (parallel after fetch)
+          - name: validate-data
+            dependencies: [fetch-raw-data]
+            template: data-validation
+            arguments:
+              artifacts:
+                - name: raw-data
+                  from: "{{tasks.fetch-raw-data.outputs.artifacts.data}}"
+
+          # Step 3: Clean and transform data
+          - name: clean-data
+            dependencies: [validate-data]
+            template: data-cleaning
+            arguments:
+              artifacts:
+                - name: validated-data
+                  from: "{{tasks.validate-data.outputs.artifacts.validated-data}}"
+
+          # Step 4: Feature engineering
+          - name: engineer-features
+            dependencies: [clean-data]
+            template: feature-engineering
+            arguments:
+              artifacts:
+                - name: clean-data
+                  from: "{{tasks.clean-data.outputs.artifacts.clean-data}}"
+
+          # Step 5: Write to Kafka processed topic
+          - name: publish-features
+            dependencies: [engineer-features]
+            template: publish-to-kafka
+            arguments:
+              parameters:
+                - name: topic
+                  value: "ml-processed-features"
+              artifacts:
+                - name: features
+                  from: "{{tasks.engineer-features.outputs.artifacts.features}}"
+
+          # Step 6: Publish quality metrics
+          - name: publish-metrics
+            dependencies: [engineer-features]
+            template: publish-quality-metrics
+            arguments:
+              artifacts:
+                - name: metrics
+                  from: "{{tasks.engineer-features.outputs.artifacts.metrics}}"
+
+    # Template: Fetch data from Kafka
+    - name: fetch-from-kafka
+      inputs:
+        parameters:
+          - name: topic
+          - name: consumer-group
+      outputs:
+        artifacts:
+          - name: data
+            path: /tmp/raw-data.json
+            s3:
+              key: "raw-data/{{workflow.name}}/{{pod.name}}/data.json"
+      container:
+        image: python:3.11-slim
+        command: [python]
+        args:
+          - -c
+          - |
+            import json
+            from kafka import KafkaConsumer
+
+            # Kafka consumer configuration
+            consumer = KafkaConsumer(
+                '{{inputs.parameters.topic}}',
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                group_id='{{inputs.parameters.consumer-group}}',
+                auto_offset_reset='earliest',
+                enable_auto_commit=False,
+                max_poll_records=1000,
+                value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+            )
+
+            # Fetch batch of messages
+            records = []
+            for message in consumer:
+                records.append(message.value)
+                if len(records) >= 1000:  # Batch size
+                    break
+
+            # Write to output file
+            with open('/tmp/raw-data.json', 'w') as f:
+                json.dump(records, f)
+
+            consumer.commit()
+            consumer.close()
+
+            print(f"Fetched {len(records)} records from {{{inputs.parameters.topic}}}")
+        env:
+          - name: PYTHONUNBUFFERED
+            value: "1"
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.5"
+          limits:
+            memory: 1Gi
+            cpu: "1"
+
+    # Template: Data validation
+    - name: data-validation
+      inputs:
+        artifacts:
+          - name: raw-data
+            path: /tmp/raw-data.json
+      outputs:
+        artifacts:
+          - name: validated-data
+            path: /tmp/validated-data.json
+            s3:
+              key: "validated-data/{{workflow.name}}/{{pod.name}}/data.json"
+          - name: validation-report
+            path: /tmp/validation-report.json
+            s3:
+              key: "validation-reports/{{workflow.name}}/{{pod.name}}/report.json"
+      container:
+        image: python:3.11-slim
+        command: [python]
+        args:
+          - -c
+          - |
+            import json
+            from datetime import datetime
+
+            # Load raw data
+            with open('/tmp/raw-data.json', 'r') as f:
+                records = json.load(f)
+
+            # Validation rules
+            validated = []
+            errors = []
+
+            for idx, record in enumerate(records):
+                try:
+                    # Check required fields
+                    assert 'id' in record, "Missing 'id' field"
+                    assert 'timestamp' in record, "Missing 'timestamp' field"
+                    assert 'features' in record, "Missing 'features' field"
+
+                    # Check data types
+                    assert isinstance(record['features'], dict), "'features' must be dict"
+
+                    # Check value ranges (example)
+                    for key, value in record['features'].items():
+                        if isinstance(value, (int, float)):
+                            assert -1e6 < value < 1e6, f"Value {key} out of range"
+
+                    validated.append(record)
+                except AssertionError as e:
+                    errors.append({'index': idx, 'error': str(e), 'record_id': record.get('id')})
+
+            # Write validated data
+            with open('/tmp/validated-data.json', 'w') as f:
+                json.dump(validated, f)
+
+            # Write validation report
+            report = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'total_records': len(records),
+                'valid_records': len(validated),
+                'invalid_records': len(errors),
+                'error_rate': len(errors) / len(records) if records else 0,
+                'errors': errors[:100]  # First 100 errors
+            }
+
+            with open('/tmp/validation-report.json', 'w') as f:
+                json.dump(report, f, indent=2)
+
+            print(f"Validation: {len(validated)}/{len(records)} valid records ({report['error_rate']:.2%} error rate)")
+
+            # Fail workflow if error rate > 10%
+            if report['error_rate'] > 0.10:
+                raise Exception(f"High error rate: {report['error_rate']:.2%}")
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "1"
+          limits:
+            memory: 2Gi
+            cpu: "2"
+
+    # Template: Data cleaning
+    - name: data-cleaning
+      inputs:
+        artifacts:
+          - name: validated-data
+            path: /tmp/validated-data.json
+      outputs:
+        artifacts:
+          - name: clean-data
+            path: /tmp/clean-data.json
+            s3:
+              key: "clean-data/{{workflow.name}}/{{pod.name}}/data.json"
+      container:
+        image: python:3.11-slim
+        command: [python]
+        args:
+          - -c
+          - |
+            import json
+
+            with open('/tmp/validated-data.json', 'r') as f:
+                records = json.load(f)
+
+            cleaned = []
+            for record in records:
+                # Remove duplicates (by id)
+                # Normalize timestamps
+                # Handle missing values
+                # Remove outliers
+
+                features = record['features']
+
+                # Example: Fill missing values with median
+                for key, value in features.items():
+                    if value is None:
+                        features[key] = 0.0  # Replace with actual median
+
+                # Example: Clip outliers
+                for key, value in features.items():
+                    if isinstance(value, (int, float)):
+                        features[key] = max(-100, min(100, value))  # Clip to [-100, 100]
+
+                record['features'] = features
+                cleaned.append(record)
+
+            with open('/tmp/clean-data.json', 'w') as f:
+                json.dump(cleaned, f)
+
+            print(f"Cleaned {len(cleaned)} records")
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Feature engineering
+    - name: feature-engineering
+      inputs:
+        artifacts:
+          - name: clean-data
+            path: /tmp/clean-data.json
+      outputs:
+        artifacts:
+          - name: features
+            path: /tmp/features.json
+            s3:
+              key: "features/{{workflow.name}}/{{pod.name}}/features.json"
+          - name: metrics
+            path: /tmp/metrics.json
+            s3:
+              key: "metrics/{{workflow.name}}/{{pod.name}}/metrics.json"
+      container:
+        image: python:3.11-slim
+        command: [python]
+        args:
+          - -c
+          - |
+            import json
+            import math
+            from datetime import datetime
+
+            with open('/tmp/clean-data.json', 'r') as f:
+                records = json.load(f)
+
+            engineered = []
+            for record in records:
+                features = record['features']
+
+                # Example feature engineering:
+                # 1. Create interaction features
+                # 2. Polynomial features
+                # 3. Binning/bucketing
+                # 4. Scaling/normalization
+
+                # Example: Add squared features
+                new_features = features.copy()
+                for key, value in features.items():
+                    if isinstance(value, (int, float)):
+                        new_features[f'{key}_squared'] = value ** 2
+                        new_features[f'{key}_log'] = math.log(abs(value) + 1)
+
+                record['features'] = new_features
+                engineered.append(record)
+
+            # Write features
+            with open('/tmp/features.json', 'w') as f:
+                json.dump(engineered, f)
+
+            # Write quality metrics
+            metrics = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'records_processed': len(engineered),
+                'feature_count': len(engineered[0]['features']) if engineered else 0,
+                'workflow_name': '{{workflow.name}}'
+            }
+
+            with open('/tmp/metrics.json', 'w') as f:
+                json.dump(metrics, f, indent=2)
+
+            print(f"Engineered {len(engineered)} records with {metrics['feature_count']} features each")
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 8Gi
+            cpu: "4"
+
+    # Template: Publish to Kafka
+    - name: publish-to-kafka
+      inputs:
+        parameters:
+          - name: topic
+        artifacts:
+          - name: features
+            path: /tmp/features.json
+      container:
+        image: python:3.11-slim
+        command: [python]
+        args:
+          - -c
+          - |
+            import json
+            from kafka import KafkaProducer
+
+            # Load features
+            with open('/tmp/features.json', 'r') as f:
+                features = json.load(f)
+
+            # Kafka producer configuration
+            producer = KafkaProducer(
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                acks='all',  # Wait for all replicas
+                retries=3,
+                max_in_flight_requests_per_connection=1  # Ensure ordering
+            )
+
+            # Publish features
+            for feature in features:
+                future = producer.send('{{inputs.parameters.topic}}', value=feature)
+                future.get(timeout=10)  # Block until sent
+
+            producer.flush()
+            producer.close()
+
+            print(f"Published {len(features)} records to {{{inputs.parameters.topic}}}")
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.5"
+          limits:
+            memory: 1Gi
+            cpu: "1"
+
+    # Template: Publish quality metrics to Kafka
+    - name: publish-quality-metrics
+      inputs:
+        artifacts:
+          - name: metrics
+            path: /tmp/metrics.json
+      container:
+        image: python:3.11-slim
+        command: [python]
+        args:
+          - -c
+          - |
+            import json
+            from kafka import KafkaProducer
+
+            # Load metrics
+            with open('/tmp/metrics.json', 'r') as f:
+                metrics = json.load(f)
+
+            # Kafka producer
+            producer = KafkaProducer(
+                bootstrap_servers=['ml-data-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092'],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+
+            # Publish to data quality topic
+            producer.send('ml-data-quality', value=metrics)
+            producer.flush()
+            producer.close()
+
+            print(f"Published quality metrics: {metrics}")
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: "0.25"
+          limits:
+            memory: 512Mi
+            cpu: "0.5"
+
+  # Retry strategy
+  retryStrategy:
+    limit: 3
+    retryPolicy: "Always"
+    backoff:
+      duration: "1m"
+      factor: 2
+      maxDuration: "10m"
+
+  # Workflow metadata
+  metadata:
+    labels:
+      pipeline: ml-data-preprocessing
+      version: v1
+
+---
+# Example: Submit workflow
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: data-preprocessing-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: data-preprocessing-pipeline
+
+---
+# CronWorkflow: Schedule preprocessing every hour
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: hourly-preprocessing
+  namespace: argo
+spec:
+  schedule: "0 * * * *"  # Every hour
+  timezone: "UTC"
+  concurrencyPolicy: "Forbid"  # Don't run concurrent instances
+  workflowSpec:
+    workflowTemplateRef:
+      name: data-preprocessing-pipeline
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5

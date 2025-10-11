@@ -1,0 +1,772 @@
+# ABOUTME: Grafana dashboards for ML platform monitoring (training, serving, GPU, cost)
+# ABOUTME: Production-ready dashboards with panels for request rate, latency, error rate, and ML-specific metrics
+
+---
+# Dashboard 1: ML Platform Overview
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-ml-overview
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  ml-platform-overview.json: |
+    {
+      "dashboard": {
+        "title": "ML Platform Overview",
+        "tags": ["ml", "overview"],
+        "timezone": "browser",
+        "schemaVersion": 16,
+        "version": 0,
+        "refresh": "30s",
+
+        "panels": [
+          {
+            "id": 1,
+            "title": "Active Training Jobs",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(kube_pod_status_phase{namespace='ml-training',phase='Running'})"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "short",
+                "thresholds": {
+                  "steps": [
+                    {"value": 0, "color": "green"},
+                    {"value": 10, "color": "yellow"},
+                    {"value": 50, "color": "red"}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+          },
+
+          {
+            "id": 2,
+            "title": "Active Model Servers",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(kube_pod_status_phase{namespace='ml-serving',phase='Running'})"
+              }
+            ],
+            "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+          },
+
+          {
+            "id": 3,
+            "title": "Total GPUs",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(nvidia_gpu_num_devices)"
+              }
+            ],
+            "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}
+          },
+
+          {
+            "id": 4,
+            "title": "GPU Utilization",
+            "type": "gauge",
+            "targets": [
+              {
+                "expr": "avg(DCGM_FI_DEV_GPU_UTIL)"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent",
+                "min": 0,
+                "max": 100,
+                "thresholds": {
+                  "steps": [
+                    {"value": 0, "color": "red"},
+                    {"value": 50, "color": "yellow"},
+                    {"value": 80, "color": "green"}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}
+          },
+
+          {
+            "id": 5,
+            "title": "Inference Requests per Second",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(rate(revision_app_request_count{namespace='ml-serving'}[5m]))"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+          },
+
+          {
+            "id": 6,
+            "title": "Inference Latency (P99)",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, sum(rate(revision_app_request_latencies_bucket{namespace='ml-serving'}[5m])) by (le))"
+              }
+            ],
+            "yaxes": [
+              {"format": "ms", "min": 0}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+          },
+
+          {
+            "id": 7,
+            "title": "Training Job Success Rate",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(rate(kube_job_status_succeeded{namespace='ml-training'}[5m])) / sum(rate(kube_job_complete{namespace='ml-training'}[5m]))"
+              }
+            ],
+            "yaxes": [
+              {"format": "percentunit", "min": 0, "max": 1}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}
+          },
+
+          {
+            "id": 8,
+            "title": "GPU Memory Usage",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg(DCGM_FI_DEV_FB_USED / DCGM_FI_DEV_FB_FREE * 100)",
+                "legendFormat": "GPU Memory %"
+              }
+            ],
+            "yaxes": [
+              {"format": "percent", "min": 0, "max": 100}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}
+          }
+        ]
+      }
+    }
+
+---
+# Dashboard 2: Training Jobs Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-training
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  training-jobs.json: |
+    {
+      "dashboard": {
+        "title": "ML Training Jobs",
+        "tags": ["ml", "training"],
+        "timezone": "browser",
+        "refresh": "30s",
+
+        "panels": [
+          {
+            "id": 1,
+            "title": "Training Jobs by Status",
+            "type": "piechart",
+            "targets": [
+              {
+                "expr": "sum by (phase) (kube_pod_status_phase{namespace='ml-training'})"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0}
+          },
+
+          {
+            "id": 2,
+            "title": "GPU Utilization per Job",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg by (pod) (DCGM_FI_DEV_GPU_UTIL{namespace='ml-training'})"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 16, "x": 8, "y": 0}
+          },
+
+          {
+            "id": 3,
+            "title": "Training Duration",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "time() - kube_pod_start_time{namespace='ml-training'}"
+              }
+            ],
+            "yaxes": [
+              {"format": "s"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+
+          {
+            "id": 4,
+            "title": "GPU Memory per Job",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum by (pod) (DCGM_FI_DEV_FB_USED{namespace='ml-training'})"
+              }
+            ],
+            "yaxes": [
+              {"format": "decmbytes"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          },
+
+          {
+            "id": 5,
+            "title": "Training Loss (Custom Metric)",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "ml_training_loss{namespace='ml-training'}"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+          },
+
+          {
+            "id": 6,
+            "title": "Training Accuracy (Custom Metric)",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "ml_training_accuracy{namespace='ml-training'}"
+              }
+            ],
+            "yaxes": [
+              {"format": "percentunit", "min": 0, "max": 1}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+          }
+        ]
+      }
+    }
+
+---
+# Dashboard 3: Model Serving Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-serving
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  model-serving.json: |
+    {
+      "dashboard": {
+        "title": "Model Serving",
+        "tags": ["ml", "serving", "kserve"],
+        "timezone": "browser",
+        "refresh": "30s",
+
+        "panels": [
+          {
+            "id": 1,
+            "title": "Request Rate by Model",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum by (service_name) (rate(revision_app_request_count{namespace='ml-serving'}[5m]))",
+                "legendFormat": "{{service_name}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "reqps"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+
+          {
+            "id": 2,
+            "title": "Error Rate by Model",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum by (service_name) (rate(revision_app_request_count{namespace='ml-serving',response_code_class='5xx'}[5m]))",
+                "legendFormat": "{{service_name}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "percentunit"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+
+          {
+            "id": 3,
+            "title": "Latency P50/P95/P99",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.50, sum(rate(revision_app_request_latencies_bucket{namespace='ml-serving'}[5m])) by (le, service_name))",
+                "legendFormat": "p50 - {{service_name}}"
+              },
+              {
+                "expr": "histogram_quantile(0.95, sum(rate(revision_app_request_latencies_bucket{namespace='ml-serving'}[5m])) by (le, service_name))",
+                "legendFormat": "p95 - {{service_name}}"
+              },
+              {
+                "expr": "histogram_quantile(0.99, sum(rate(revision_app_request_latencies_bucket{namespace='ml-serving'}[5m])) by (le, service_name))",
+                "legendFormat": "p99 - {{service_name}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "ms"}
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+
+          {
+            "id": 4,
+            "title": "Replica Count by Model",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum by (service_name) (kube_deployment_status_replicas{namespace='ml-serving'})",
+                "legendFormat": "{{service_name}}"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+          },
+
+          {
+            "id": 5,
+            "title": "Autoscaling Events",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "autoscaler_desired_pods{namespace='ml-serving'}",
+                "legendFormat": "Desired - {{service_name}}"
+              },
+              {
+                "expr": "autoscaler_actual_pods{namespace='ml-serving'}",
+                "legendFormat": "Actual - {{service_name}}"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+          },
+
+          {
+            "id": 6,
+            "title": "Cold Starts",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(activator_request_count{namespace='ml-serving'}[5m])"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+          },
+
+          {
+            "id": 7,
+            "title": "Model Prediction Distribution",
+            "type": "heatmap",
+            "targets": [
+              {
+                "expr": "rate(ml_prediction_value_bucket[5m])"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+          }
+        ]
+      }
+    }
+
+---
+# Dashboard 4: GPU Utilization Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-gpu
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  gpu-utilization.json: |
+    {
+      "dashboard": {
+        "title": "GPU Utilization",
+        "tags": ["gpu", "nvidia"],
+        "timezone": "browser",
+        "refresh": "30s",
+
+        "panels": [
+          {
+            "id": 1,
+            "title": "GPU Utilization by Node",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg by (instance) (DCGM_FI_DEV_GPU_UTIL)",
+                "legendFormat": "{{instance}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "percent", "min": 0, "max": 100}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+
+          {
+            "id": 2,
+            "title": "GPU Memory by Node",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg by (instance) (DCGM_FI_DEV_FB_USED)",
+                "legendFormat": "{{instance}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "decmbytes"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+
+          {
+            "id": 3,
+            "title": "GPU Temperature",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg by (instance) (DCGM_FI_DEV_GPU_TEMP)",
+                "legendFormat": "{{instance}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "celsius"}
+            ],
+            "alert": {
+              "conditions": [
+                {
+                  "evaluator": {"params": [85], "type": "gt"},
+                  "query": {"params": ["A", "5m", "now"]},
+                  "reducer": {"params": [], "type": "avg"},
+                  "type": "query"
+                }
+              ],
+              "name": "GPU Temperature High"
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+
+          {
+            "id": 4,
+            "title": "GPU Power Usage",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "avg by (instance) (DCGM_FI_DEV_POWER_USAGE)",
+                "legendFormat": "{{instance}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "watt"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          },
+
+          {
+            "id": 5,
+            "title": "GPU Utilization Heatmap",
+            "type": "heatmap",
+            "targets": [
+              {
+                "expr": "DCGM_FI_DEV_GPU_UTIL"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+          },
+
+          {
+            "id": 6,
+            "title": "GPU Memory Fragmentation",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "(DCGM_FI_DEV_FB_FREE / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)) * 100"
+              }
+            ],
+            "yaxes": [
+              {"format": "percent", "min": 0, "max": 100}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+          },
+
+          {
+            "id": 7,
+            "title": "GPUs in Use vs Idle",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(DCGM_FI_DEV_GPU_UTIL > 5)"
+              },
+              {
+                "expr": "sum(DCGM_FI_DEV_GPU_UTIL <= 5)"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+          }
+        ]
+      }
+    }
+
+---
+# Dashboard 5: Cost Attribution Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-cost
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  cost-attribution.json: |
+    {
+      "dashboard": {
+        "title": "Cost Attribution",
+        "tags": ["cost", "opencost"],
+        "timezone": "browser",
+        "refresh": "5m",
+
+        "panels": [
+          {
+            "id": 1,
+            "title": "Cost by Namespace",
+            "type": "piechart",
+            "targets": [
+              {
+                "expr": "sum by (namespace) (container_cpu_allocation * on(node) group_left() avg(node_cpu_hourly_cost))"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+
+          {
+            "id": 2,
+            "title": "Cost by Team",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "sum by (team) (container_cpu_allocation * on(node) group_left() avg(node_cpu_hourly_cost))",
+                "format": "table"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+
+          {
+            "id": 3,
+            "title": "GPU Cost Over Time",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(container_gpu_allocation * on(node) group_left() avg(node_gpu_hourly_cost))"
+              }
+            ],
+            "yaxes": [
+              {"format": "currencyUSD"}
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+
+          {
+            "id": 4,
+            "title": "Most Expensive Models",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "topk(10, sum by (model) (container_cpu_allocation * on(node) group_left() avg(node_cpu_hourly_cost)))",
+                "format": "table"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+          },
+
+          {
+            "id": 5,
+            "title": "Cost Efficiency (Cost per Request)",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(container_cpu_allocation * on(node) group_left() avg(node_cpu_hourly_cost)) / sum(rate(revision_app_request_count[1h]))"
+              }
+            ],
+            "yaxes": [
+              {"format": "currencyUSD"}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+          }
+        ]
+      }
+    }
+
+---
+# Dashboard 6: Model Performance Dashboard
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-model-performance
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  model-performance.json: |
+    {
+      "dashboard": {
+        "title": "Model Performance & Drift",
+        "tags": ["ml", "performance", "drift"],
+        "timezone": "browser",
+        "refresh": "1m",
+
+        "panels": [
+          {
+            "id": 1,
+            "title": "Model Accuracy by Version",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "ml_model_accuracy",
+                "legendFormat": "{{model}} v{{version}}"
+              }
+            ],
+            "yaxes": [
+              {"format": "percentunit", "min": 0, "max": 1}
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+
+          {
+            "id": 2,
+            "title": "Data Drift Score",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "ml_model_drift",
+                "legendFormat": "{{model}}"
+              }
+            ],
+            "alert": {
+              "conditions": [
+                {
+                  "evaluator": {"params": [0.15], "type": "gt"},
+                  "query": {"params": ["A", "5m", "now"]},
+                  "reducer": {"params": [], "type": "avg"},
+                  "type": "query"
+                }
+              ],
+              "name": "High Data Drift Detected"
+            },
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+
+          {
+            "id": 3,
+            "title": "Prediction Confidence Distribution",
+            "type": "heatmap",
+            "targets": [
+              {
+                "expr": "rate(ml_prediction_confidence_bucket[5m])"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+
+          {
+            "id": 4,
+            "title": "Model Retraining Events",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "changes(ml_model_version_info[1d])",
+                "format": "table"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+          },
+
+          {
+            "id": 5,
+            "title": "Feature Drift by Feature",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "ml_feature_drift",
+                "legendFormat": "{{feature}}"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+          }
+        ]
+      }
+    }
+
+---
+# Best Practices Summary:
+#
+# 1. Dashboard Organization:
+#    - Overview: High-level metrics for executives
+#    - Training: Detailed training job metrics
+#    - Serving: Request rate, latency, errors
+#    - GPU: Hardware utilization and health
+#    - Cost: Spend attribution
+#    - Performance: Model accuracy and drift
+#
+# 2. Panel Best Practices:
+#    - Use appropriate visualization (graph, stat, gauge, table)
+#    - Set meaningful thresholds (red/yellow/green)
+#    - Include units (ms, %, $, req/s)
+#    - Add legends for multi-series
+#    - Use log scale for wide ranges
+#
+# 3. Refresh Rates:
+#    - Overview: 30s (fast enough for monitoring)
+#    - Training: 1m (training is slow)
+#    - Serving: 10s (catch issues quickly)
+#    - Cost: 5m (cost doesn't change fast)
+#
+# 4. Time Ranges:
+#    - Default: Last 6 hours
+#    - Training: Last 24 hours
+#    - Cost: Last 30 days
+#    - Allow user selection
+#
+# 5. Variables:
+#    - Namespace selector
+#    - Model selector
+#    - Time range selector
+#    - Team selector (for multi-tenancy)
+#
+# Dashboard metrics:
+# - 50-100 panels across 6 dashboards
+# - Query performance: < 1s per panel
+# - Auto-refresh: Every 30s-1m
+# - Shared with teams via URL
+#
+# Import dashboards:
+# kubectl apply -f components/05-observability/grafana/ml-monitoring-dashboards.yaml
+#
+# Access dashboards:
+# 1. Port-forward: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80
+# 2. Open http://localhost:3000
+# 3. Navigate to Dashboards → ML Platform

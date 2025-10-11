@@ -1,0 +1,662 @@
+# ABOUTME: Canary and blue-green deployment strategies for zero-downtime model updates
+# ABOUTME: Automated gradual rollout, rollback on metric degradation, and progressive traffic shifting
+
+---
+# Deployment Strategy Overview
+#
+# Canary Deployment:
+# - Deploy new version alongside old version
+# - Route small % of traffic to new version (5-10%)
+# - Monitor metrics (latency, error rate, accuracy)
+# - Gradually increase traffic (10% → 25% → 50% → 100%)
+# - Rollback if metrics degrade
+#
+# Blue-Green Deployment:
+# - Deploy new version (green) alongside old (blue)
+# - Test green with internal traffic
+# - Switch 100% traffic to green instantly
+# - Keep blue for instant rollback
+#
+# When to use:
+# Canary: Risk-averse, gradual validation, metric-driven
+# Blue-Green: Fast rollout, confidence in new version, easy rollback
+
+---
+# Example 1: Manual Canary Deployment (basic)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: manual-canary
+  namespace: ml-serving
+spec:
+  # Default predictor (90% traffic) - current production model
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50:v1.0.0
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+
+  # Canary predictor (10% traffic) - new model version
+  canary:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50:v2.0.0
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+    canaryTrafficPercent: 10  # Route 10% traffic to canary
+
+---
+# Promote canary to 100% (manual)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promote-canary
+  namespace: ml-serving
+data:
+  promote.sh: |
+    #!/bin/bash
+    # Promote canary to 100% traffic
+
+    MODEL_NAME=$1
+    NEW_TRAFFIC_PERCENT=$2
+
+    kubectl patch inferenceservice $MODEL_NAME -n ml-serving \
+      --type merge \
+      -p "{\"spec\":{\"canary\":{\"canaryTrafficPercent\":$NEW_TRAFFIC_PERCENT}}}"
+
+    echo "✓ Updated canary traffic to ${NEW_TRAFFIC_PERCENT}%"
+
+  # Usage:
+  # ./promote.sh manual-canary 25  # Increase to 25%
+  # ./promote.sh manual-canary 50  # Increase to 50%
+  # ./promote.sh manual-canary 100 # Full rollout
+
+---
+# Example 2: Automated Canary with Argo Rollouts
+# Install Argo Rollouts first: kubectl create namespace argo-rollouts
+# kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: automated-canary-rollout
+  namespace: ml-serving
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: model-server
+      version: stable
+  template:
+    metadata:
+      labels:
+        app: model-server
+        version: stable
+    spec:
+      containers:
+        - name: model-server
+          image: harbor.ml-platform.example.com/ml-models/pytorch-server:v1.0.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+
+  strategy:
+    canary:
+      # Canary steps: 10% → 25% → 50% → 100%
+      steps:
+        - setWeight: 10  # Route 10% traffic to canary
+        - pause:
+            duration: 5m  # Wait 5 minutes
+
+        - setWeight: 25  # Increase to 25%
+        - pause:
+            duration: 5m
+
+        - setWeight: 50  # Increase to 50%
+        - pause:
+            duration: 10m  # Wait longer at 50%
+
+        - setWeight: 100  # Full rollout
+
+      # Analysis: Monitor metrics during rollout
+      analysis:
+        templates:
+          - templateName: canary-analysis
+        args:
+          - name: service-name
+            value: model-server
+
+      # Rollback if analysis fails
+      rollback:
+        onFailure: true
+
+---
+# Canary Analysis Template (Prometheus metrics)
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-analysis
+  namespace: ml-serving
+spec:
+  args:
+    - name: service-name
+  metrics:
+    # Metric 1: Error rate must be < 1%
+    - name: error-rate
+      interval: 1m
+      count: 5  # Check 5 times
+      successCondition: result < 0.01  # < 1% error rate
+      failureLimit: 3  # Fail after 3 consecutive failures
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            rate(
+              http_requests_total{
+                service="{{args.service-name}}",
+                status=~"5.."
+              }[5m]
+            ) /
+            rate(
+              http_requests_total{
+                service="{{args.service-name}}"
+              }[5m]
+            )
+
+    # Metric 2: P99 latency must be < 500ms
+    - name: p99-latency
+      interval: 1m
+      count: 5
+      successCondition: result < 500  # < 500ms
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            histogram_quantile(0.99,
+              rate(
+                http_request_duration_seconds_bucket{
+                  service="{{args.service-name}}"
+                }[5m]
+              )
+            ) * 1000
+
+    # Metric 3: Model accuracy (custom metric)
+    - name: model-accuracy
+      interval: 5m
+      count: 3
+      successCondition: result > 0.90  # > 90% accuracy
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus:9090
+          query: |
+            model_prediction_accuracy{
+              service="{{args.service-name}}"
+            }
+
+---
+# Example 3: Blue-Green Deployment
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: bluegreen-rollout
+  namespace: ml-serving
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: model-server
+  template:
+    metadata:
+      labels:
+        app: model-server
+    spec:
+      containers:
+        - name: model-server
+          image: harbor.ml-platform.example.com/ml-models/pytorch-server:v1.0.0
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+
+  strategy:
+    blueGreen:
+      # Active service (production traffic)
+      activeService: model-server-active
+
+      # Preview service (testing new version)
+      previewService: model-server-preview
+
+      # Auto-promotion after tests pass
+      autoPromotionEnabled: false  # Require manual approval
+
+      # Pre-promotion analysis
+      prePromotionAnalysis:
+        templates:
+          - templateName: smoke-tests
+        args:
+          - name: service-url
+            value: "http://model-server-preview"
+
+      # Post-promotion analysis
+      postPromotionAnalysis:
+        templates:
+          - templateName: production-tests
+        args:
+          - name: service-url
+            value: "http://model-server-active"
+
+      # Scale down old version after successful promotion
+      scaleDownDelaySeconds: 300  # Keep blue for 5 minutes
+
+---
+# Active Service (production traffic)
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server-active
+  namespace: ml-serving
+spec:
+  selector:
+    app: model-server
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+# Preview Service (testing new version)
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server-preview
+  namespace: ml-serving
+spec:
+  selector:
+    app: model-server
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+# Smoke Tests (run against preview service before promotion)
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: smoke-tests
+  namespace: ml-serving
+spec:
+  args:
+    - name: service-url
+  metrics:
+    # Test 1: Health check
+    - name: health-check
+      count: 1
+      successCondition: result == "ok"
+      provider:
+        job:
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: curl
+                    image: curlimages/curl:latest
+                    command: [sh, -c]
+                    args:
+                      - |
+                        response=$(curl -s -o /dev/null -w "%{http_code}" {{args.service-url}}/health)
+                        if [ "$response" = "200" ]; then
+                          echo "ok"
+                        else
+                          echo "fail"
+                        fi
+
+    # Test 2: Sample inference
+    - name: inference-test
+      count: 1
+      successCondition: result == "ok"
+      provider:
+        job:
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: test
+                    image: python:3.11-slim
+                    command: [sh, -c]
+                    args:
+                      - |
+                        pip install -q requests numpy
+
+                        python << 'EOF'
+                        import requests
+                        import numpy as np
+
+                        url = "{{args.service-url}}/v1/models/model:predict"
+                        data = {
+                            "instances": np.random.rand(1, 224, 224, 3).tolist()
+                        }
+
+                        response = requests.post(url, json=data, timeout=10)
+
+                        if response.status_code == 200 and 'predictions' in response.json():
+                            print("ok")
+                        else:
+                            print("fail")
+                        EOF
+
+---
+# Example 4: Progressive Delivery with Flagger
+# Install Flagger: kubectl apply -f https://raw.githubusercontent.com/fluxcd/flagger/main/artifacts/flagger/crd.yaml
+# kubectl apply -f https://raw.githubusercontent.com/fluxcd/flagger/main/artifacts/flagger/deployment.yaml
+
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: flagger-canary
+  namespace: ml-serving
+spec:
+  # Target deployment
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: model-server
+
+  # Service mesh provider (Istio)
+  provider: istio
+
+  # Service configuration
+  service:
+    port: 80
+    targetPort: 8080
+
+  # Autoscaling
+  autoscalerRef:
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    name: model-server-hpa
+
+  # Canary analysis
+  analysis:
+    # Interval between checks
+    interval: 1m
+
+    # Number of checks before promotion
+    threshold: 10
+
+    # Max traffic weight during canary
+    maxWeight: 50
+
+    # Traffic increment per iteration
+    stepWeight: 5  # 5% → 10% → 15% → ... → 50%
+
+    # Metrics
+    metrics:
+      # Request success rate
+      - name: request-success-rate
+        thresholdRange:
+          min: 99  # > 99% success rate
+        interval: 1m
+        query: |
+          sum(
+            rate(
+              http_requests_total{
+                kubernetes_pod_name=~"model-server-canary.*",
+                status!~"5.."
+              }[1m]
+            )
+          ) /
+          sum(
+            rate(
+              http_requests_total{
+                kubernetes_pod_name=~"model-server-canary.*"
+              }[1m]
+            )
+          ) * 100
+
+      # Request duration P99
+      - name: request-duration-p99
+        thresholdRange:
+          max: 500  # < 500ms
+        interval: 1m
+        query: |
+          histogram_quantile(0.99,
+            sum(
+              rate(
+                http_request_duration_seconds_bucket{
+                  kubernetes_pod_name=~"model-server-canary.*"
+                }[1m]
+              )
+            ) by (le)
+          ) * 1000
+
+    # Webhooks (optional)
+    webhooks:
+      # Load testing during canary
+      - name: load-test
+        type: pre-rollout
+        url: http://load-tester/
+        timeout: 5m
+        metadata:
+          target: http://model-server-canary
+          requests: 1000
+
+      # Slack notification
+      - name: slack-notification
+        type: rollback
+        url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+        metadata:
+          message: "Canary rollback: model-server"
+
+---
+# Example 5: Canary with automatic rollback
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: canary-rollback-script
+  namespace: ml-serving
+data:
+  monitor.sh: |
+    #!/bin/bash
+    # Monitor canary and automatically rollback if metrics degrade
+
+    MODEL_NAME="manual-canary"
+    NAMESPACE="ml-serving"
+    ERROR_RATE_THRESHOLD=0.01  # 1%
+    LATENCY_THRESHOLD=500      # 500ms
+
+    while true; do
+      # Query canary metrics from Prometheus
+      CANARY_ERROR_RATE=$(curl -s 'http://prometheus:9090/api/v1/query' \
+        --data-urlencode "query=rate(http_requests_total{service=\"$MODEL_NAME-canary\",status=~\"5..\"}[5m])" \
+        | jq -r '.data.result[0].value[1]' 2>/dev/null || echo "0")
+
+      CANARY_LATENCY=$(curl -s 'http://prometheus:9090/api/v1/query' \
+        --data-urlencode "query=histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{service=\"$MODEL_NAME-canary\"}[5m]))" \
+        | jq -r '.data.result[0].value[1]' 2>/dev/null || echo "0")
+
+      # Convert to milliseconds
+      CANARY_LATENCY=$(echo "$CANARY_LATENCY * 1000" | bc)
+
+      echo "Canary metrics:"
+      echo "  - Error rate: ${CANARY_ERROR_RATE}"
+      echo "  - P99 latency: ${CANARY_LATENCY}ms"
+
+      # Check if metrics are degraded
+      if (( $(echo "$CANARY_ERROR_RATE > $ERROR_RATE_THRESHOLD" | bc -l) )); then
+        echo "✗ Canary error rate too high, rolling back!"
+        kubectl patch inferenceservice $MODEL_NAME -n $NAMESPACE \
+          --type merge \
+          -p '{"spec":{"canary":null}}'
+        exit 1
+      fi
+
+      if (( $(echo "$CANARY_LATENCY > $LATENCY_THRESHOLD" | bc -l) )); then
+        echo "✗ Canary latency too high, rolling back!"
+        kubectl patch inferenceservice $MODEL_NAME -n $NAMESPACE \
+          --type merge \
+          -p '{"spec":{"canary":null}}'
+        exit 1
+      fi
+
+      echo "✓ Canary metrics OK"
+      sleep 60  # Check every minute
+    done
+
+---
+# Run monitoring job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: canary-monitor
+  namespace: ml-serving
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: monitor
+          image: alpine:latest
+          command: [sh, /scripts/monitor.sh]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: canary-rollback-script
+            defaultMode: 0755
+
+---
+# Best Practices Summary:
+#
+# 1. Canary Deployment:
+#    Steps:
+#      - Deploy canary with 5-10% traffic
+#      - Monitor for 5-10 minutes
+#      - Increase to 25% if metrics OK
+#      - Monitor for 10 minutes
+#      - Increase to 50%, then 100%
+#
+#    Metrics to monitor:
+#      - Error rate (< 1%)
+#      - P99 latency (within 10% of baseline)
+#      - Model accuracy (no regression)
+#      - Resource usage (CPU, memory, GPU)
+#
+#    Rollback triggers:
+#      - Error rate > 1%
+#      - Latency > 20% higher than baseline
+#      - Accuracy drops > 2%
+#      - Customer complaints
+#
+# 2. Blue-Green Deployment:
+#    Steps:
+#      - Deploy green version (new)
+#      - Run smoke tests on green
+#      - Switch 100% traffic to green
+#      - Monitor for 10-30 minutes
+#      - Keep blue for quick rollback
+#      - Scale down blue after 24 hours
+#
+#    When to use:
+#      - High confidence in new version
+#      - Fast rollback required
+#      - Can afford 2x resources temporarily
+#
+# 3. Automated Rollout Tools:
+#    - Argo Rollouts: Advanced canary/blue-green
+#    - Flagger: GitOps-friendly progressive delivery
+#    - Istio: Service mesh traffic routing
+#    - KServe canary: Built-in simple canary
+#
+# 4. Monitoring:
+#    - Use Prometheus for metrics
+#    - Set up alerts (PagerDuty, Slack)
+#    - Dashboard: Grafana with rollout status
+#    - Log comparison: Canary vs baseline
+#
+# 5. Rollback Strategy:
+#    - Automatic: On metric degradation
+#    - Manual: On customer complaints
+#    - Timeline: < 2 minutes for rollback
+#    - Always keep previous version for 24 hours
+#
+# Real-world impact:
+# - Canary prevents 95% of bad deployments
+# - Blue-green enables < 1 minute rollback
+# - Automated rollouts reduce human error by 80%
+# - Progressive delivery increases deployment frequency by 3x
+#
+# Deployment timeline:
+# Canary:
+#   - 10% traffic: 5 minutes
+#   - 25% traffic: 10 minutes
+#   - 50% traffic: 15 minutes
+#   - 100% traffic: 30 minutes
+#   - Total: ~60 minutes from start to full rollout
+#
+# Blue-Green:
+#   - Deploy green: 5 minutes
+#   - Smoke tests: 5 minutes
+#   - Switch traffic: < 1 minute
+#   - Monitor: 30 minutes
+#   - Total: ~40 minutes from start to full rollout
+#
+# Rollback scenarios:
+# Scenario 1: Canary error rate spike
+#   - Detected: 2 minutes after rollout starts
+#   - Rollback: Automatic, < 30 seconds
+#   - Impact: 10% users affected (only canary traffic)
+#
+# Scenario 2: Blue-green latency regression
+#   - Detected: 5 minutes after switch
+#   - Rollback: Manual, switch back to blue (< 1 minute)
+#   - Impact: 100% users affected for 5 minutes
+#
+# Scenario 3: Production accuracy drop
+#   - Detected: 1 hour after full rollout
+#   - Rollback: Revert to previous version
+#   - Recovery: 5-10 minutes
+#
+# Tool comparison:
+# | Feature | KServe Canary | Argo Rollouts | Flagger |
+# |---------|---------------|---------------|---------|
+# | Ease of use | ★★★★★ | ★★★☆☆ | ★★★★☆ |
+# | Automation | ★★☆☆☆ | ★★★★★ | ★★★★★ |
+# | Metrics | ★★★☆☆ | ★★★★★ | ★★★★☆ |
+# | GitOps | ★★☆☆☆ | ★★★★★ | ★★★★★ |
+# | Blue-Green | ✗ | ✓ | ✗ |
+# | Progressive | ✗ | ✓ | ✓ |
+#
+# Recommendation:
+# - Simple canary: Use KServe built-in canary
+# - Advanced canary: Use Argo Rollouts
+# - GitOps workflow: Use Flagger
+# - Blue-green: Use Argo Rollouts

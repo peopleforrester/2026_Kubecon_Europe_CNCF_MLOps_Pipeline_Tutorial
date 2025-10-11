@@ -1,0 +1,524 @@
+# ABOUTME: Jaeger distributed tracing for ML inference pipelines and training workflows
+# ABOUTME: End-to-end request tracing from client → preprocessing → model → postprocessing with latency breakdown
+
+---
+# Distributed Tracing Overview
+#
+# Why tracing for ML:
+# 1. Debug latency issues (which step is slow?)
+# 2. Understand request flow (transformer → model → explainer)
+# 3. Identify bottlenecks (preprocessing takes 80% of time)
+# 4. Trace failures (where did request fail?)
+# 5. Performance optimization (which GPU op is slowest?)
+#
+# Jaeger components:
+# - Agent: Receives traces from applications (sidecar)
+# - Collector: Processes and stores traces
+# - Query: UI for viewing traces
+# - Storage: Elasticsearch or Cassandra
+#
+# OpenTelemetry integration:
+# - Instrument Python code with OpenTelemetry SDK
+# - Traces sent to Jaeger collector
+# - View in Jaeger UI
+#
+# Real-world impact:
+# - 10x faster debugging (see exact slow step)
+# - 50% latency reduction (identify bottlenecks)
+# - 99% request success visibility
+
+---
+# Install Jaeger Operator
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-install
+  namespace: observability
+data:
+  install.sh: |
+    #!/bin/bash
+    # Install Jaeger Operator
+
+    echo "=== Installing Jaeger Operator ==="
+
+    # Install cert-manager (prerequisite)
+    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.yaml
+
+    # Wait for cert-manager
+    kubectl wait --for=condition=ready pod \
+      -l app.kubernetes.io/component=webhook \
+      -n cert-manager \
+      --timeout=5m
+
+    # Install Jaeger Operator
+    kubectl create -f https://github.com/jaegertracing/jaeger-operator/releases/download/v1.51.0/jaeger-operator.yaml -n observability
+
+    echo "✓ Jaeger Operator installed"
+
+---
+# Jaeger instance with Elasticsearch storage
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger-ml-platform
+  namespace: observability
+spec:
+  strategy: production  # HA deployment
+
+  # Collector configuration
+  collector:
+    replicas: 3
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 1
+        memory: 2Gi
+
+  # Query UI configuration
+  query:
+    replicas: 2
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  # Ingester configuration
+  ingester:
+    replicas: 3
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 1
+        memory: 2Gi
+
+  # Storage configuration (Elasticsearch)
+  storage:
+    type: elasticsearch
+    elasticsearch:
+      nodeCount: 3
+      storage:
+        className: fast-ssd
+        size: 100Gi
+      resources:
+        requests:
+          cpu: 1
+          memory: 4Gi
+        limits:
+          cpu: 2
+          memory: 8Gi
+      redundancyPolicy: MultipleRedundancy
+
+  # Sampling strategy
+  sampling:
+    options:
+      default_strategy:
+        type: probabilistic
+        param: 0.1  # Sample 10% of requests
+
+---
+# OpenTelemetry Collector (bridge to Jaeger)
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  mode: deployment
+  replicas: 3
+
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+
+      # Add ML-specific attributes
+      attributes:
+        actions:
+          - key: ml.platform
+            value: kubecon-demo
+            action: insert
+
+    exporters:
+      jaeger:
+        endpoint: jaeger-ml-platform-collector:14250
+        tls:
+          insecure: true
+
+      # Also export to Prometheus for metrics
+      prometheus:
+        endpoint: 0.0.0.0:8889
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch, attributes]
+          exporters: [jaeger]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [prometheus]
+
+---
+# Instrumented model serving example (Python with OpenTelemetry)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: instrumented-model-code
+  namespace: ml-serving
+data:
+  model_server.py: |
+    from flask import Flask, request, jsonify
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.flask import FlaskInstrumentor
+    import torch
+    import time
+
+    # Initialize tracing
+    trace.set_tracer_provider(TracerProvider())
+    tracer = trace.get_tracer(__name__)
+
+    # Export to OpenTelemetry Collector
+    otlp_exporter = OTLPSpanExporter(
+        endpoint="otel-collector.observability:4317",
+        insecure=True
+    )
+    span_processor = BatchSpanProcessor(otlp_exporter)
+    trace.get_tracer_provider().add_span_processor(span_processor)
+
+    app = Flask(__name__)
+    FlaskInstrumentor().instrument_app(app)
+
+    # Load model
+    model = torch.hub.load('pytorch/vision:v0.10.0', 'resnet50', pretrained=True)
+    model.eval()
+
+    @app.route('/predict', methods=['POST'])
+    def predict():
+        with tracer.start_as_current_span("predict") as span:
+            data = request.json
+
+            # Preprocessing
+            with tracer.start_as_current_span("preprocess"):
+                span.set_attribute("ml.input_size", len(data['instances']))
+                start_time = time.time()
+
+                # Simulate preprocessing
+                preprocessed = preprocess_data(data['instances'])
+
+                preprocess_duration = time.time() - start_time
+                span.set_attribute("ml.preprocess_duration_ms", preprocess_duration * 1000)
+
+            # Model inference
+            with tracer.start_as_current_span("inference"):
+                start_time = time.time()
+
+                with torch.no_grad():
+                    predictions = model(preprocessed)
+
+                inference_duration = time.time() - start_time
+                span.set_attribute("ml.inference_duration_ms", inference_duration * 1000)
+                span.set_attribute("ml.model_name", "resnet50")
+                span.set_attribute("ml.model_version", "1.0.0")
+
+            # Postprocessing
+            with tracer.start_as_current_span("postprocess"):
+                start_time = time.time()
+
+                result = postprocess_predictions(predictions)
+
+                postprocess_duration = time.time() - start_time
+                span.set_attribute("ml.postprocess_duration_ms", postprocess_duration * 1000)
+
+            # Total duration
+            total_duration = preprocess_duration + inference_duration + postprocess_duration
+            span.set_attribute("ml.total_duration_ms", total_duration * 1000)
+
+            return jsonify({'predictions': result})
+
+    def preprocess_data(instances):
+        # Preprocessing logic
+        return torch.tensor(instances)
+
+    def postprocess_predictions(predictions):
+        # Postprocessing logic
+        return predictions.tolist()
+
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=8080)
+
+---
+# Deployment with tracing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traced-model-server
+  namespace: ml-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: traced-model-server
+  template:
+    metadata:
+      labels:
+        app: traced-model-server
+    spec:
+      containers:
+        - name: model-server
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q flask torch opentelemetry-api opentelemetry-sdk opentelemetry-instrumentation-flask opentelemetry-exporter-otlp
+
+              python /code/model_server.py
+
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: code
+              mountPath: /code
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: "resnet50-inference"
+            - name: OTEL_TRACES_EXPORTER
+              value: "otlp"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability:4317"
+
+      volumes:
+        - name: code
+          configMap:
+            name: instrumented-model-code
+
+---
+# Service for traced model server
+apiVersion: v1
+kind: Service
+metadata:
+  name: traced-model-server
+  namespace: ml-serving
+spec:
+  selector:
+    app: traced-model-server
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+# Example: Training job with distributed tracing
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traced-training-job
+  namespace: ml-training
+data:
+  train_with_tracing.py: |
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    import torch
+    import time
+
+    # Initialize tracing
+    trace.set_tracer_provider(TracerProvider())
+    tracer = trace.get_tracer(__name__)
+
+    otlp_exporter = OTLPSpanExporter(
+        endpoint="otel-collector.observability:4317",
+        insecure=True
+    )
+    span_processor = BatchSpanProcessor(otlp_exporter)
+    trace.get_tracer_provider().add_span_processor(span_processor)
+
+    # Training loop with tracing
+    with tracer.start_as_current_span("training_job") as span:
+        span.set_attribute("ml.model_name", "resnet50")
+        span.set_attribute("ml.num_epochs", 10)
+
+        for epoch in range(10):
+            with tracer.start_as_current_span(f"epoch_{epoch}"):
+                # Data loading
+                with tracer.start_as_current_span("data_loading"):
+                    time.sleep(0.1)  # Simulate data loading
+
+                # Forward pass
+                with tracer.start_as_current_span("forward_pass"):
+                    time.sleep(0.5)  # Simulate forward pass
+
+                # Backward pass
+                with tracer.start_as_current_span("backward_pass"):
+                    time.sleep(0.3)  # Simulate backward pass
+
+                # Optimizer step
+                with tracer.start_as_current_span("optimizer_step"):
+                    time.sleep(0.1)  # Simulate optimizer
+
+---
+# Jaeger Query UI Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jaeger-query
+  namespace: observability
+  annotations:
+    kubernetes.io/ingress.class: istio
+spec:
+  rules:
+    - host: jaeger.ml-platform.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jaeger-ml-platform-query
+                port:
+                  number: 16686
+
+---
+# Verification and usage guide
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-usage-guide
+  namespace: observability
+data:
+  usage.sh: |
+    #!/bin/bash
+    # Access Jaeger UI
+
+    echo "=== Accessing Jaeger UI ==="
+
+    # Port-forward Jaeger Query
+    kubectl port-forward -n observability svc/jaeger-ml-platform-query 16686:16686 &
+    PF_PID=$!
+
+    echo "Jaeger UI: http://localhost:16686"
+    echo ""
+    echo "Features:"
+    echo "  1. Search traces by service, operation, duration"
+    echo "  2. View trace timeline (see latency breakdown)"
+    echo "  3. Compare traces (identify regressions)"
+    echo "  4. Service dependency graph"
+    echo ""
+    echo "Example queries:"
+    echo "  - Service: resnet50-inference"
+    echo "  - Operation: predict"
+    echo "  - Min Duration: 100ms (find slow requests)"
+    echo ""
+    echo "Press Ctrl+C to stop"
+
+    wait $PF_PID
+
+---
+# Best Practices Summary:
+#
+# 1. Instrumentation:
+#    - Use OpenTelemetry (vendor-neutral)
+#    - Instrument at boundaries (HTTP, gRPC, database)
+#    - Add custom spans for important operations
+#    - Include ML-specific attributes:
+#      - ml.model_name
+#      - ml.model_version
+#      - ml.inference_duration_ms
+#      - ml.batch_size
+#
+# 2. Sampling:
+#    - Production: 1-10% sampling (reduce overhead)
+#    - Development: 100% sampling (debug all requests)
+#    - Error traces: Always sample (catch failures)
+#    - Slow traces: Always sample (p99 > 500ms)
+#
+# 3. Span Attributes:
+#    Required:
+#      - service.name (e.g., "resnet50-inference")
+#      - operation.name (e.g., "predict")
+#      - span.kind (e.g., "server", "client")
+#
+#    ML-specific:
+#      - ml.model_name: "resnet50"
+#      - ml.model_version: "1.0.0"
+#      - ml.framework: "pytorch"
+#      - ml.batch_size: 32
+#      - ml.input_size: [224, 224, 3]
+#      - ml.preprocessing_duration_ms: 50
+#      - ml.inference_duration_ms: 100
+#      - ml.postprocessing_duration_ms: 10
+#
+# 4. Storage:
+#    - Elasticsearch: Best for production (scalable)
+#    - Memory: Development only (not persistent)
+#    - Retention: 7-30 days (balance cost vs history)
+#    - 1M traces/day = ~10GB storage/day
+#
+# 5. Integration:
+#    - Istio: Automatic tracing for service mesh
+#    - KServe: Instrument predictor code
+#    - Argo Workflows: Trace entire pipeline
+#    - Kafka: Trace message propagation
+#
+# Real-world impact:
+# - 10x faster debugging (see exact slow step)
+# - 50% latency reduction (identify bottlenecks)
+# - 99% request visibility (trace failures)
+# - 5 minute MTTR (from trace to fix)
+#
+# Trace example:
+# Request: POST /predict
+# Total duration: 250ms
+#
+# Breakdown:
+# ├─ HTTP receive: 2ms
+# ├─ preprocess: 50ms (20%)
+# │  ├─ decode_image: 30ms
+# │  └─ resize: 20ms
+# ├─ inference: 180ms (72%)  ← Bottleneck!
+# │  ├─ model_forward: 170ms
+# │  └─ argmax: 10ms
+# ├─ postprocess: 15ms (6%)
+# └─ HTTP send: 3ms
+#
+# Action: Optimize inference (use TensorRT, quantization)
+#
+# Trace volume:
+# - 1000 req/s * 10% sampling = 100 traces/s
+# - 100 traces/s * 86400s = 8.6M traces/day
+# - Average trace size: 5KB
+# - Storage: 8.6M * 5KB = 43GB/day
+# - Retention: 30 days = 1.3TB total
+#
+# Quick start:
+# 1. Install: kubectl apply -f distributed-tracing.yaml
+# 2. Instrument code with OpenTelemetry SDK
+# 3. Send test requests
+# 4. View traces: http://localhost:16686
+# 5. Search for slow requests (duration > 100ms)
+# 6. Identify bottleneck from trace breakdown

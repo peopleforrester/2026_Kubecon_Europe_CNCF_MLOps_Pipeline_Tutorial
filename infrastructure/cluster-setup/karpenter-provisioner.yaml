@@ -1,0 +1,234 @@
+# ABOUTME: Karpenter Provisioner for GPU node auto-scaling with spot instance support
+# ABOUTME: Automatically provisions GPU nodes when pods request nvidia.com/gpu resources
+
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: gpu-provisioner
+spec:
+  # Requirements for nodes provisioned by this Provisioner
+  requirements:
+    # Instance types: GPU-enabled instances only
+    - key: karpenter.k8s.aws/instance-family
+      operator: In
+      values:
+        - p3    # V100 GPUs (16GB, 32GB)
+        - p4d   # A100 GPUs (40GB)
+        - g4dn  # T4 GPUs (16GB) - cost-effective for inference
+        - g5    # A10G GPUs (24GB) - newer architecture
+
+    # Availability zones (spread across AZs for HA)
+    - key: topology.kubernetes.io/zone
+      operator: In
+      values:
+        - us-west-2a
+        - us-west-2b
+        - us-west-2c
+
+    # Capacity type: Prioritize spot instances (70% cost savings)
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values:
+        - spot           # Prefer spot instances
+        - on-demand      # Fallback to on-demand if spot unavailable
+
+    # Architecture
+    - key: kubernetes.io/arch
+      operator: In
+      values:
+        - amd64
+
+  # Limits: Maximum resources this provisioner can create
+  limits:
+    resources:
+      cpu: "1000"       # Max 1000 CPUs across all nodes
+      memory: 4000Gi    # Max 4TB RAM
+      nvidia.com/gpu: "32"  # Max 32 GPUs
+
+  # Provider-specific configuration (AWS)
+  providerRef:
+    name: gpu-node-template
+
+  # TTL: Time-to-live for nodes
+  ttlSecondsAfterEmpty: 300     # Delete node 5 minutes after last pod removed
+  ttlSecondsUntilExpired: 604800  # Max node lifetime: 7 days (mitigates spot interruption risk)
+
+  # Consolidation: Optimize node packing
+  consolidation:
+    enabled: true
+
+  # Weight: Higher weight = higher priority (useful with multiple provisioners)
+  weight: 10
+
+---
+# AWS-specific Node Template
+apiVersion: karpenter.k8s.aws/v1alpha1
+kind: AWSNodeTemplate
+metadata:
+  name: gpu-node-template
+spec:
+  # AMI selection: Use EKS-optimized GPU AMI
+  amiFamily: AL2  # Amazon Linux 2
+
+  # AMI selector (automatically uses latest EKS GPU-optimized AMI)
+  amiSelector:
+    karpenter.sh/discovery: "eks-cluster-name"  # Replace with your cluster name
+
+  # Subnet selector (GPU nodes should be in private subnets)
+  subnetSelector:
+    karpenter.sh/discovery: "eks-cluster-name"
+    kubernetes.io/role/internal-elb: "1"  # Private subnets for GPU nodes
+
+  # Security group selector
+  securityGroupSelector:
+    karpenter.sh/discovery: "eks-cluster-name"
+
+  # Instance profile (IAM role for GPU nodes)
+  instanceProfile: "KarpenterNodeInstanceProfile-eks-cluster-name"
+
+  # User data: Bootstrap script for GPU nodes
+  userData: |
+    #!/bin/bash
+    # Install NVIDIA drivers and container toolkit
+    /etc/eks/bootstrap.sh eks-cluster-name --container-runtime containerd \
+      --kubelet-extra-args '--node-labels=nvidia.com/gpu.present=true,node-role=gpu-worker'
+
+    # Load NVIDIA kernel modules
+    modprobe nvidia
+    modprobe nvidia-uvm
+
+  # Block device mappings (storage configuration)
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 200Gi  # 200GB root volume
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+
+  # Metadata options (IMDSv2 required for security)
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 2
+    httpTokens: required  # Require IMDSv2
+
+  # Tags for GPU nodes
+  tags:
+    Name: "karpenter-gpu-node"
+    Environment: "production"
+    ManagedBy: "karpenter"
+    NodeType: "gpu"
+    CostCenter: "ml-training"
+
+---
+# Spot Interruption Handling with Node Draining
+# Karpenter automatically drains nodes on spot interruption warnings (2 minutes notice)
+# This configuration ensures training jobs with checkpoints can save state before termination
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-interruption-handler
+  namespace: karpenter
+data:
+  config.yaml: |
+    # Spot interruption handling configuration
+    spot:
+      # Drain nodes gracefully on interruption notice
+      drainBeforeTermination: true
+
+      # Grace period for pod termination (matches checkpoint interval)
+      terminationGracePeriodSeconds: 120
+
+      # Webhook URL for interruption notifications (optional)
+      webhookURL: ""
+
+---
+# Karpenter Disruption Budget
+# Prevents too many nodes from being disrupted simultaneously
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: karpenter-disruption-budget
+  namespace: karpenter
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: karpenter
+
+---
+# Example: Pod triggering GPU node provisioning
+# When this pod is created, Karpenter will provision a GPU node if none available
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-gpu-pod
+  labels:
+    app: training
+spec:
+  # NodeSelector ensures pod only runs on GPU nodes
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+  # Tolerations for GPU node taints
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+  # Affinity preferences
+  affinity:
+    nodeAffinity:
+      # Prefer spot instances for cost savings
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - key: karpenter.sh/capacity-type
+                operator: In
+                values:
+                  - spot
+
+    # Anti-affinity: Spread pods across different nodes for fault tolerance
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                    - training
+            topologyKey: kubernetes.io/hostname
+
+  containers:
+    - name: trainer
+      image: pytorch/pytorch:2.0.0-cuda11.8-cudnn8-runtime
+      command: ["python", "train.py"]
+
+      resources:
+        requests:
+          nvidia.com/gpu: 2  # Requests 2 GPUs
+          memory: "32Gi"
+          cpu: "8"
+        limits:
+          nvidia.com/gpu: 2
+          memory: "32Gi"
+
+      # Checkpoint volume for spot interruption recovery
+      volumeMounts:
+        - name: checkpoints
+          mountPath: /workspace/checkpoints
+
+  volumes:
+    - name: checkpoints
+      persistentVolumeClaim:
+        claimName: training-checkpoints
+
+  # Grace period allows checkpoint saving before pod termination
+  terminationGracePeriodSeconds: 120

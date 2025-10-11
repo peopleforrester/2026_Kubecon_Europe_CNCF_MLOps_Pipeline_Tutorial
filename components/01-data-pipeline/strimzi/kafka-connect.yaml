@@ -1,0 +1,213 @@
+# ABOUTME: Kafka Connect cluster for ML data ingestion from external sources
+# ABOUTME: Connectors for S3, databases, and streaming sources into Kafka topics
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: ml-data-connect
+  namespace: kafka
+  labels:
+    app: kafka-connect
+  annotations:
+    # Enable building custom connector images
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 3.7.0
+  replicas: 3  # 3 workers for HA
+
+  # Bootstrap servers
+  bootstrapServers: ml-data-cluster-kafka-bootstrap:9092
+
+  # Connector configuration
+  config:
+    # Connect cluster configuration
+    group.id: ml-data-connect-cluster
+    offset.storage.topic: ml-connect-offsets
+    config.storage.topic: ml-connect-configs
+    status.storage.topic: ml-connect-status
+
+    # Replication factors
+    offset.storage.replication.factor: 3
+    config.storage.replication.factor: 3
+    status.storage.replication.factor: 3
+
+    # Converter configuration (use JSON for ML data)
+    key.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    key.converter.schemas.enable: false
+    value.converter.schemas.enable: true
+
+    # Plugin path
+    plugin.path: /opt/kafka/plugins
+
+  # Build custom image with connectors
+  build:
+    output:
+      type: docker
+      image: quay.io/ml-pipeline/kafka-connect-ml:latest
+    plugins:
+      # S3 Source Connector (ingest data from S3)
+      - name: kafka-connect-s3-source
+        artifacts:
+          - type: tgz
+            url: https://d1i4a15mxbxib1.cloudfront.net/api/plugins/confluentinc/kafka-connect-s3-source/versions/2.6.0/confluentinc-kafka-connect-s3-source-2.6.0.zip
+
+      # S3 Sink Connector (backup to S3)
+      - name: kafka-connect-s3
+        artifacts:
+          - type: tgz
+            url: https://d1i4a15mxbxib1.cloudfront.net/api/plugins/confluentinc/kafka-connect-s3/versions/10.5.0/confluentinc-kafka-connect-s3-10.5.0.zip
+
+      # JDBC Source Connector (ingest from databases)
+      - name: kafka-connect-jdbc
+        artifacts:
+          - type: tgz
+            url: https://d1i4a15mxbxib1.cloudfront.net/api/plugins/confluentinc/kafka-connect-jdbc/versions/10.7.4/confluentinc-kafka-connect-jdbc-10.7.4.zip
+
+      # Debezium PostgreSQL CDC Connector (change data capture)
+      - name: debezium-postgres
+        artifacts:
+          - type: tgz
+            url: https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.5.0.Final/debezium-connector-postgres-2.5.0.Final-plugin.tar.gz
+
+  # Resources
+  resources:
+    requests:
+      memory: 2Gi
+      cpu: "1"
+    limits:
+      memory: 4Gi
+      cpu: "2"
+
+  # JVM options
+  jvmOptions:
+    -Xms: 1g
+    -Xmx: 1g
+
+  # Metrics for Prometheus
+  metricsConfig:
+    type: jmxPrometheusExporter
+    valueFrom:
+      configMapKeyRef:
+        name: kafka-connect-metrics
+        key: metrics-config.yml
+
+---
+# Kafka Connect Metrics ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-connect-metrics
+  namespace: kafka
+data:
+  metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+      # Connector metrics
+      - pattern: kafka.connect<type=connect-worker-metrics><>([a-z-]+)
+        name: kafka_connect_worker_$1
+        type: GAUGE
+
+      # Task metrics
+      - pattern: kafka.connect<type=connector-task-metrics, connector=(.+), task=(.+)><>([a-z-]+)
+        name: kafka_connect_task_$3
+        type: GAUGE
+        labels:
+          connector: "$1"
+          task: "$2"
+
+---
+# Example: S3 Source Connector (ingest CSV files from S3)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: s3-source-ml-data
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-connect
+spec:
+  class: io.confluent.connect.s3.source.S3SourceConnector
+  tasksMax: 6  # Parallel tasks
+  config:
+    # S3 configuration
+    s3.bucket.name: "ml-training-data"
+    s3.region: "us-west-2"
+    aws.access.key.id: "${env:AWS_ACCESS_KEY_ID}"
+    aws.secret.access.key: "${env:AWS_SECRET_ACCESS_KEY}"
+
+    # Source configuration
+    format.class: "io.confluent.connect.s3.format.json.JsonFormat"
+    topics.dir: "raw-data"
+    topic.regex.list: "ml-raw-data:.*\\.json"
+
+    # Kafka topic
+    kafka.topic: "ml-raw-data"
+
+    # Polling
+    poll.interval.ms: "5000"  # Poll every 5 seconds
+
+    # Error handling
+    errors.tolerance: "all"
+    errors.log.enable: "true"
+    errors.deadletterqueue.topic.name: "ml-dlq"
+    errors.deadletterqueue.topic.replication.factor: "3"
+
+---
+# Example: PostgreSQL CDC Connector (capture database changes)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: postgres-cdc-user-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: ml-data-connect
+spec:
+  class: io.debezium.connector.postgresql.PostgresConnector
+  tasksMax: 1  # CDC is single-threaded per table
+  config:
+    # Database connection
+    database.hostname: "postgres.database.svc.cluster.local"
+    database.port: "5432"
+    database.user: "debezium"
+    database.password: "${env:POSTGRES_PASSWORD}"
+    database.dbname: "production"
+    database.server.name: "production-db"
+
+    # Tables to capture
+    table.include.list: "public.user_events,public.transactions"
+
+    # Kafka topic naming
+    topic.prefix: "postgres"
+
+    # Plugin (pgoutput is built-in to Postgres 10+)
+    plugin.name: "pgoutput"
+
+    # Slot configuration
+    slot.name: "debezium_ml_data"
+    publication.name: "debezium_publication"
+
+    # Snapshot mode
+    snapshot.mode: "initial"  # Initial snapshot, then CDC
+
+    # Schema changes
+    schema.history.internal.kafka.bootstrap.servers: "ml-data-cluster-kafka-bootstrap:9092"
+    schema.history.internal.kafka.topic: "schema-changes.production"
+
+---
+# ServiceMonitor for Kafka Connect metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-connect-metrics
+  namespace: kafka
+  labels:
+    app: kafka-connect
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/kind: KafkaConnect
+      strimzi.io/name: ml-data-connect
+  endpoints:
+    - port: tcp-prometheus
+      interval: 30s
+      path: /metrics

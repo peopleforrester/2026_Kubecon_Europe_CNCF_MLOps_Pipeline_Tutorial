@@ -1,0 +1,479 @@
+# ABOUTME: Standalone data preprocessing example using Argo Workflows
+# ABOUTME: Demonstrates basic preprocessing steps without Kafka integration for quick testing
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: preprocessing-example-
+  namespace: argo
+  labels:
+    app: ml-data-pipeline
+    example: preprocessing
+spec:
+  serviceAccountName: workflow-submitter
+
+  entrypoint: preprocessing-steps
+
+  # Arguments
+  arguments:
+    parameters:
+      - name: input-file
+        value: "s3://ml-pipeline-artifacts/sample-data/input.parquet"
+      - name: output-file
+        value: "s3://ml-pipeline-artifacts/sample-data/output.parquet"
+
+  templates:
+    # Main preprocessing steps
+    - name: preprocessing-steps
+      steps:
+        # Step 1: Load and generate sample data
+        - - name: load-data
+            template: load-sample-data
+
+        # Step 2: Data validation (parallel)
+        - - name: validate-schema
+            template: validate-data-schema
+            arguments:
+              artifacts:
+                - name: input-data
+                  from: "{{steps.load-data.outputs.artifacts.dataset}}"
+
+          - name: validate-quality
+            template: validate-data-quality
+            arguments:
+              artifacts:
+                - name: input-data
+                  from: "{{steps.load-data.outputs.artifacts.dataset}}"
+
+        # Step 3: Preprocessing transformations (sequential)
+        - - name: handle-missing
+            template: handle-missing-values
+            arguments:
+              artifacts:
+                - name: input-data
+                  from: "{{steps.load-data.outputs.artifacts.dataset}}"
+
+        - - name: remove-outliers
+            template: remove-outliers
+            arguments:
+              artifacts:
+                - name: input-data
+                  from: "{{steps.handle-missing.outputs.artifacts.processed-data}}"
+
+        - - name: scale-features
+            template: scale-numerical-features
+            arguments:
+              artifacts:
+                - name: input-data
+                  from: "{{steps.remove-outliers.outputs.artifacts.processed-data}}"
+
+        - - name: encode-categoricals
+            template: encode-categorical-features
+            arguments:
+              artifacts:
+                - name: input-data
+                  from: "{{steps.scale-features.outputs.artifacts.processed-data}}"
+
+        # Step 4: Final output
+        - - name: save-output
+            template: save-processed-data
+            arguments:
+              artifacts:
+                - name: final-data
+                  from: "{{steps.encode-categoricals.outputs.artifacts.processed-data}}"
+
+    # Template: Load sample data
+    - name: load-sample-data
+      outputs:
+        artifacts:
+          - name: dataset
+            path: /data/sample.parquet
+            s3:
+              key: "examples/preprocessing/{{workflow.name}}/input.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow numpy
+            python3 << 'EOF'
+            import pandas as pd
+            import numpy as np
+
+            np.random.seed(42)
+
+            # Generate sample dataset
+            n = 5000
+
+            df = pd.DataFrame({
+                'id': range(n),
+                'age': np.random.randint(18, 80, n),
+                'income': np.random.lognormal(10, 1, n),
+                'education': np.random.choice(['HS', 'Bachelor', 'Master', 'PhD'], n),
+                'employment': np.random.choice(['employed', 'unemployed', 'retired'], n),
+                'credit_score': np.random.randint(300, 850, n),
+                'loan_amount': np.random.randint(1000, 100000, n),
+                'interest_rate': np.random.uniform(3.0, 15.0, n),
+                'default': np.random.choice([0, 1], n, p=[0.85, 0.15])
+            })
+
+            # Add some missing values intentionally
+            df.loc[np.random.choice(n, 100, replace=False), 'income'] = np.nan
+            df.loc[np.random.choice(n, 50, replace=False), 'credit_score'] = np.nan
+
+            # Add some outliers
+            df.loc[np.random.choice(n, 10, replace=False), 'income'] = df['income'].max() * 10
+
+            df.to_parquet('/data/sample.parquet', index=False)
+
+            print(f"Generated sample dataset: {df.shape}")
+            print(f"Missing values: {df.isnull().sum().sum()}")
+            print(f"Columns: {list(df.columns)}")
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Validate schema
+    - name: validate-data-schema
+      inputs:
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Expected schema
+            expected_cols = ['id', 'age', 'income', 'education', 'employment',
+                           'credit_score', 'loan_amount', 'interest_rate', 'default']
+
+            # Validate columns
+            missing_cols = set(expected_cols) - set(df.columns)
+            unexpected_cols = set(df.columns) - set(expected_cols)
+
+            if missing_cols:
+                raise ValueError(f"Missing columns: {missing_cols}")
+
+            if unexpected_cols:
+                print(f"Warning: Unexpected columns: {unexpected_cols}")
+
+            # Validate data types
+            assert df['age'].dtype in ['int64', 'float64'], "Age must be numeric"
+            assert df['income'].dtype in ['int64', 'float64'], "Income must be numeric"
+            assert df['default'].dtype in ['int64', 'float64'], "Default must be numeric"
+
+            print("✓ Schema validation passed")
+            print(f"  Rows: {len(df)}")
+            print(f"  Columns: {len(df.columns)}")
+            EOF
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.25"
+          limits:
+            memory: 1Gi
+            cpu: "0.5"
+
+    # Template: Validate quality
+    - name: validate-data-quality
+      inputs:
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Check for duplicates
+            duplicates = df.duplicated(subset=['id']).sum()
+            if duplicates > 0:
+                print(f"Warning: {duplicates} duplicate IDs found")
+
+            # Check missing value rates
+            missing_rates = df.isnull().sum() / len(df)
+            high_missing = missing_rates[missing_rates > 0.5]
+
+            if len(high_missing) > 0:
+                raise ValueError(f"High missing rates: {high_missing.to_dict()}")
+
+            # Check value ranges
+            assert df['age'].min() >= 0 and df['age'].max() <= 120, "Age out of range"
+            assert df['credit_score'].min() >= 300 and df['credit_score'].max() <= 850, "Credit score out of range"
+            assert df['default'].isin([0, 1]).all(), "Default must be 0 or 1"
+
+            print("✓ Quality validation passed")
+            print(f"  Missing value rates: {missing_rates[missing_rates > 0].to_dict()}")
+            EOF
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.25"
+          limits:
+            memory: 1Gi
+            cpu: "0.5"
+
+    # Template: Handle missing values
+    - name: handle-missing-values
+      inputs:
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: processed-data
+            path: /data/output.parquet
+            s3:
+              key: "examples/preprocessing/{{workflow.name}}/step1-missing.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+
+            df = pd.read_parquet('/data/input.parquet')
+
+            before_missing = df.isnull().sum().sum()
+
+            # Fill missing numerical values with median
+            for col in ['income', 'credit_score', 'age']:
+                if df[col].isnull().any():
+                    median = df[col].median()
+                    df[col].fillna(median, inplace=True)
+
+            # Fill missing categorical with mode
+            for col in ['education', 'employment']:
+                if df[col].isnull().any():
+                    mode = df[col].mode()[0]
+                    df[col].fillna(mode, inplace=True)
+
+            after_missing = df.isnull().sum().sum()
+
+            df.to_parquet('/data/output.parquet', index=False)
+
+            print(f"✓ Handled missing values: {before_missing} → {after_missing}")
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Remove outliers
+    - name: remove-outliers
+      inputs:
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: processed-data
+            path: /data/output.parquet
+            s3:
+              key: "examples/preprocessing/{{workflow.name}}/step2-outliers.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+
+            df = pd.read_parquet('/data/input.parquet')
+
+            before_rows = len(df)
+
+            # Remove outliers using IQR method
+            for col in ['income', 'credit_score', 'loan_amount', 'interest_rate']:
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+
+                lower_bound = Q1 - 3 * IQR
+                upper_bound = Q3 + 3 * IQR
+
+                # Clip values instead of removing rows
+                df[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
+
+            after_rows = len(df)
+
+            df.to_parquet('/data/output.parquet', index=False)
+
+            print(f"✓ Removed outliers: {before_rows} → {after_rows} rows")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Scale numerical features
+    - name: scale-numerical-features
+      inputs:
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: processed-data
+            path: /data/output.parquet
+            s3:
+              key: "examples/preprocessing/{{workflow.name}}/step3-scaled.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scikit-learn
+            python3 << 'EOF'
+            import pandas as pd
+            from sklearn.preprocessing import StandardScaler
+
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Select numerical columns to scale
+            numerical_cols = ['age', 'income', 'credit_score', 'loan_amount', 'interest_rate']
+
+            # Scale
+            scaler = StandardScaler()
+            df[numerical_cols] = scaler.fit_transform(df[numerical_cols])
+
+            df.to_parquet('/data/output.parquet', index=False)
+
+            print(f"✓ Scaled {len(numerical_cols)} numerical features")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Encode categorical features
+    - name: encode-categorical-features
+      inputs:
+        artifacts:
+          - name: input-data
+            path: /data/input.parquet
+      outputs:
+        artifacts:
+          - name: processed-data
+            path: /data/output.parquet
+            s3:
+              key: "examples/preprocessing/{{workflow.name}}/step4-encoded.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow scikit-learn
+            python3 << 'EOF'
+            import pandas as pd
+            from sklearn.preprocessing import OneHotEncoder
+
+            df = pd.read_parquet('/data/input.parquet')
+
+            # Select categorical columns
+            categorical_cols = ['education', 'employment']
+
+            # One-hot encode
+            encoder = OneHotEncoder(sparse_output=False, drop='first')
+            encoded = encoder.fit_transform(df[categorical_cols])
+
+            # Create feature names
+            feature_names = encoder.get_feature_names_out(categorical_cols)
+
+            # Replace categorical columns with encoded ones
+            df = df.drop(columns=categorical_cols)
+            encoded_df = pd.DataFrame(encoded, columns=feature_names, index=df.index)
+            df = pd.concat([df, encoded_df], axis=1)
+
+            df.to_parquet('/data/output.parquet', index=False)
+
+            print(f"✓ Encoded {len(categorical_cols)} categorical features")
+            print(f"  Output shape: {df.shape}")
+            print(f"  Columns: {list(df.columns)}")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Save final output
+    - name: save-processed-data
+      inputs:
+        artifacts:
+          - name: final-data
+            path: /data/final.parquet
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+
+            df = pd.read_parquet('/data/final.parquet')
+
+            print("=" * 60)
+            print("PREPROCESSING COMPLETE")
+            print("=" * 60)
+            print(f"Final dataset shape: {df.shape}")
+            print(f"Columns: {list(df.columns)}")
+            print(f"\nSample rows:")
+            print(df.head())
+            print(f"\nData types:")
+            print(df.dtypes)
+            print(f"\nMissing values: {df.isnull().sum().sum()}")
+            print("=" * 60)
+
+            # Output location
+            output_path = '{{workflow.parameters.output-file}}'
+            print(f"\n✓ Processed data saved to: {output_path}")
+            EOF
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.25"
+          limits:
+            memory: 1Gi
+            cpu: "0.5"
+
+---
+# Quick submit command:
+# kubectl create -f examples/preprocessing-example.yaml -n argo
+#
+# Monitor:
+# kubectl get workflows -n argo
+# kubectl logs -n argo <workflow-pod-name>

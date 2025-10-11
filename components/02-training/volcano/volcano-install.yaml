@@ -1,0 +1,429 @@
+# ABOUTME: Volcano scheduler installation for gang scheduling in distributed ML training
+# ABOUTME: Prevents deadlocks by ensuring all worker pods start together or not at all
+
+---
+# Install Volcano using Helm (recommended):
+# helm repo add volcano-sh https://volcano-sh.github.io/helm-charts
+# helm install volcano volcano-sh/volcano -n volcano-system --create-namespace
+#
+# Or apply this manifest for custom installation:
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: volcano-system
+  labels:
+    app: volcano
+
+---
+# Volcano Scheduler (gang scheduling + GPU scheduling)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: volcano-scheduler
+  namespace: volcano-system
+  labels:
+    app: volcano-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: volcano-scheduler
+  template:
+    metadata:
+      labels:
+        app: volcano-scheduler
+    spec:
+      serviceAccountName: volcano-scheduler
+      containers:
+        - name: volcano-scheduler
+          image: volcanosh/vc-scheduler:v1.9.0
+          args:
+            - --logtostderr
+            - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
+            - --enable-healthz=true
+            - --enable-metrics=true
+            - --leader-elect=true
+            - --leader-elect-resource-namespace=volcano-system
+            - -v=3
+          ports:
+            - containerPort: 8080
+              name: metrics
+              protocol: TCP
+          volumeMounts:
+            - name: scheduler-config
+              mountPath: /volcano.scheduler
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 11251
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 11251
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: scheduler-config
+          configMap:
+            name: volcano-scheduler-configmap
+
+---
+# Volcano Controller (job lifecycle management)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: volcano-controllers
+  namespace: volcano-system
+  labels:
+    app: volcano-controllers
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: volcano-controllers
+  template:
+    metadata:
+      labels:
+        app: volcano-controllers
+    spec:
+      serviceAccountName: volcano-controllers
+      containers:
+        - name: volcano-controllers
+          image: volcanosh/vc-controller-manager:v1.9.0
+          args:
+            - --logtostderr
+            - --enable-healthz=true
+            - --leader-elect=true
+            - --leader-elect-resource-namespace=volcano-system
+            - -v=3
+          ports:
+            - containerPort: 11251
+              name: healthz
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 11251
+              scheme: HTTP
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 11251
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+---
+# Volcano Admission Webhook (validates and mutates volcano jobs)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: volcano-admission
+  namespace: volcano-system
+  labels:
+    app: volcano-admission
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: volcano-admission
+  template:
+    metadata:
+      labels:
+        app: volcano-admission
+    spec:
+      serviceAccountName: volcano-admission
+      containers:
+        - name: volcano-admission
+          image: volcanosh/vc-webhook-manager:v1.9.0
+          args:
+            - --logtostderr
+            - --tls-cert-file=/admission.local.config/certificates/tls.crt
+            - --tls-private-key-file=/admission.local.config/certificates/tls.key
+            - --ca-cert-file=/admission.local.config/certificates/ca.crt
+            - --webhook-namespace=volcano-system
+            - --webhook-service-name=volcano-admission-service
+            - --port=8443
+            - -v=3
+          ports:
+            - containerPort: 8443
+              name: webhook
+              protocol: TCP
+          volumeMounts:
+            - name: admission-certs
+              mountPath: /admission.local.config/certificates
+              readOnly: true
+          resources:
+            requests:
+              cpu: "200m"
+              memory: 256Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+      volumes:
+        - name: admission-certs
+          secret:
+            secretName: volcano-admission-secret
+
+---
+# Volcano Scheduler Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: volcano-scheduler-configmap
+  namespace: volcano-system
+data:
+  volcano-scheduler.conf: |
+    actions: "enqueue, allocate, backfill"
+    tiers:
+    - plugins:
+      - name: priority
+      - name: gang
+        enablePreemptable: false
+      - name: conformance
+    - plugins:
+      - name: drf
+        enablePreemptable: false
+      - name: deviceshare
+        arguments:
+          deviceshare.GPUNumberEnable: true
+          deviceshare.GPUMemoryEnable: true
+      - name: predicates
+      - name: proportion
+      - name: nodeorder
+      - name: binpack
+
+---
+# ServiceAccount for Volcano Scheduler
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: volcano-scheduler
+  namespace: volcano-system
+
+---
+# ServiceAccount for Volcano Controllers
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: volcano-controllers
+  namespace: volcano-system
+
+---
+# ServiceAccount for Volcano Admission
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: volcano-admission
+  namespace: volcano-system
+
+---
+# ClusterRole for Volcano Scheduler
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: volcano-scheduler
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "persistentvolumeclaims", "persistentvolumes", "namespaces", "resourcequotas"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods/binding"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: ["batch.volcano.sh"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["batch.volcano.sh"]
+    resources: ["jobs/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups", "queues", "priorityclasses"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups/status", "queues/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["nodeinfo.volcano.sh"]
+    resources: ["numatopologies"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volcano-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: volcano-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: volcano-scheduler
+    namespace: volcano-system
+
+---
+# ClusterRole for Volcano Controllers
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: volcano-controllers
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: ["batch.volcano.sh"]
+    resources: ["jobs"]
+    verbs: ["*"]
+  - apiGroups: ["batch.volcano.sh"]
+    resources: ["jobs/status", "jobs/finalizers"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups", "queues"]
+    verbs: ["*"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups/status", "queues/status", "podgroups/finalizers"]
+    verbs: ["update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volcano-controllers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: volcano-controllers
+subjects:
+  - kind: ServiceAccount
+    name: volcano-controllers
+    namespace: volcano-system
+
+---
+# ClusterRole for Volcano Admission
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: volcano-admission
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+    verbs: ["get", "list", "watch", "create", "update"]
+  - apiGroups: ["batch.volcano.sh"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["queues", "podgroups"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volcano-admission
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: volcano-admission
+subjects:
+  - kind: ServiceAccount
+    name: volcano-admission
+    namespace: volcano-system
+
+---
+# Service for Volcano Admission Webhook
+apiVersion: v1
+kind: Service
+metadata:
+  name: volcano-admission-service
+  namespace: volcano-system
+spec:
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP
+  selector:
+    app: volcano-admission
+
+---
+# Service for Volcano Scheduler metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: volcano-scheduler-service
+  namespace: volcano-system
+  labels:
+    app: volcano-scheduler
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: metrics
+  selector:
+    app: volcano-scheduler
+
+---
+# ServiceMonitor for Prometheus (volcano scheduler metrics)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: volcano-scheduler
+  namespace: volcano-system
+  labels:
+    app: volcano-scheduler
+spec:
+  selector:
+    matchLabels:
+      app: volcano-scheduler
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+
+---
+# Quick install command (Helm recommended):
+# helm repo add volcano-sh https://volcano-sh.github.io/helm-charts
+# helm repo update
+# helm install volcano volcano-sh/volcano -n volcano-system --create-namespace --version v1.9.0
+#
+# Verify installation:
+# kubectl get pods -n volcano-system
+# kubectl get crd | grep volcano
+#
+# Expected CRDs:
+# - jobs.batch.volcano.sh
+# - podgroups.scheduling.volcano.sh
+# - queues.scheduling.volcano.sh

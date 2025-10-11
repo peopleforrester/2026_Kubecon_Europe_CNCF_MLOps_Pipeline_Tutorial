@@ -1,0 +1,467 @@
+# ABOUTME: Feast feature store integration example for ML pipeline
+# ABOUTME: Demonstrates feature ingestion, retrieval, and serving with Feast on Kubernetes
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: feast-integration-
+  namespace: argo
+  labels:
+    app: ml-data-pipeline
+    example: feast-integration
+spec:
+  serviceAccountName: workflow-submitter
+
+  entrypoint: feast-pipeline
+
+  templates:
+    # Main Feast integration pipeline
+    - name: feast-pipeline
+      dag:
+        tasks:
+          # Step 1: Generate features
+          - name: generate-features
+            template: create-feature-data
+
+          # Step 2: Materialize to Feast offline store
+          - name: materialize-offline
+            dependencies: [generate-features]
+            template: feast-materialize-offline
+            arguments:
+              artifacts:
+                - name: features
+                  from: "{{tasks.generate-features.outputs.artifacts.features}}"
+
+          # Step 3: Materialize to Feast online store
+          - name: materialize-online
+            dependencies: [materialize-offline]
+            template: feast-materialize-online
+
+          # Step 4: Retrieve historical features (for training)
+          - name: get-historical-features
+            dependencies: [materialize-offline]
+            template: feast-get-historical
+
+          # Step 5: Retrieve online features (for serving)
+          - name: get-online-features
+            dependencies: [materialize-online]
+            template: feast-get-online
+
+    # Template: Create feature data
+    - name: create-feature-data
+      outputs:
+        artifacts:
+          - name: features
+            path: /data/features.parquet
+            s3:
+              key: "feast-examples/{{workflow.name}}/features.parquet"
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q pandas pyarrow numpy
+            python3 << 'EOF'
+            import pandas as pd
+            import numpy as np
+            from datetime import datetime, timedelta
+
+            np.random.seed(42)
+
+            # Generate feature data for users
+            n_users = 1000
+            n_days = 30
+
+            data = []
+            for user_id in range(1, n_users + 1):
+                for day in range(n_days):
+                    timestamp = datetime.now() - timedelta(days=n_days - day)
+                    data.append({
+                        'user_id': user_id,
+                        'event_timestamp': timestamp,
+                        'daily_transactions': np.random.poisson(5),
+                        'total_amount': np.random.lognormal(4, 1),
+                        'avg_transaction_amount': np.random.lognormal(3, 0.5),
+                        'unique_merchants': np.random.randint(1, 10),
+                        'is_weekend': timestamp.weekday() >= 5,
+                        'days_since_signup': np.random.randint(1, 365)
+                    })
+
+            df = pd.DataFrame(data)
+
+            # Save to parquet
+            df.to_parquet('/data/features.parquet', index=False)
+
+            print(f"Generated feature data: {df.shape}")
+            print(f"Users: {df['user_id'].nunique()}")
+            print(f"Date range: {df['event_timestamp'].min()} to {df['event_timestamp'].max()}")
+            print(f"\nSample:")
+            print(df.head())
+            EOF
+        resources:
+          requests:
+            memory: 1Gi
+            cpu: "0.5"
+          limits:
+            memory: 2Gi
+            cpu: "1"
+
+    # Template: Materialize to Feast offline store
+    - name: feast-materialize-offline
+      inputs:
+        artifacts:
+          - name: features
+            path: /data/features.parquet
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q feast pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+            from feast import FeatureStore, Entity, FeatureView, Field
+            from feast.types import Float32, Int64, Bool
+            from feast.data_source import FileSource
+            from datetime import timedelta
+
+            # Load features
+            df = pd.read_parquet('/data/features.parquet')
+
+            # Initialize Feast feature store (assumes feature_store.yaml exists)
+            # In production, this would connect to S3/BigQuery for offline store
+            # For demo, using local file system
+
+            print("Setting up Feast feature definitions...")
+
+            # Define entity
+            user = Entity(
+                name="user",
+                join_keys=["user_id"],
+                description="User entity"
+            )
+
+            # Define data source
+            source = FileSource(
+                path="/data/features.parquet",
+                timestamp_field="event_timestamp"
+            )
+
+            # Define feature view
+            user_features = FeatureView(
+                name="user_transaction_features",
+                entities=[user],
+                ttl=timedelta(days=30),
+                schema=[
+                    Field(name="daily_transactions", dtype=Int64),
+                    Field(name="total_amount", dtype=Float32),
+                    Field(name="avg_transaction_amount", dtype=Float32),
+                    Field(name="unique_merchants", dtype=Int64),
+                    Field(name="is_weekend", dtype=Bool),
+                    Field(name="days_since_signup", dtype=Int64),
+                ],
+                source=source,
+                online=True,
+            )
+
+            print(f"✓ Defined feature view: {user_features.name}")
+            print(f"  Features: {[f.name for f in user_features.schema]}")
+            print(f"  TTL: {user_features.ttl}")
+
+            # In production, would run:
+            # store = FeatureStore(repo_path=".")
+            # store.apply([user, user_features])
+            # store.materialize_incremental(end_date=datetime.now())
+
+            print("\n✓ Features ready for materialization to offline store")
+            print("  In production: feast materialize-incremental")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Materialize to Feast online store
+    - name: feast-materialize-online
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q feast redis
+            python3 << 'EOF'
+            from feast import FeatureStore
+            from datetime import datetime, timedelta
+
+            print("Materializing features to online store (Redis)...")
+
+            # In production, would run:
+            # store = FeatureStore(repo_path=".")
+            # store.materialize(
+            #     start_date=datetime.now() - timedelta(days=30),
+            #     end_date=datetime.now()
+            # )
+
+            print("\n✓ Features materialized to online store")
+            print("  Online store: Redis")
+            print("  Use case: Real-time feature serving for inference")
+            print("\n  Example Redis connection:")
+            print("    Host: feast-online-store.default.svc.cluster.local")
+            print("    Port: 6379")
+            EOF
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.25"
+          limits:
+            memory: 1Gi
+            cpu: "0.5"
+
+    # Template: Get historical features for training
+    - name: feast-get-historical
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q feast pandas pyarrow
+            python3 << 'EOF'
+            import pandas as pd
+            from feast import FeatureStore
+            from datetime import datetime, timedelta
+
+            print("Retrieving historical features for training...")
+
+            # Create entity dataframe (users and timestamps for training)
+            entity_df = pd.DataFrame({
+                'user_id': list(range(1, 101)),  # First 100 users
+                'event_timestamp': [datetime.now() - timedelta(days=7)] * 100
+            })
+
+            print(f"Entity DataFrame shape: {entity_df.shape}")
+
+            # In production, would retrieve features:
+            # store = FeatureStore(repo_path=".")
+            # training_df = store.get_historical_features(
+            #     entity_df=entity_df,
+            #     features=[
+            #         "user_transaction_features:daily_transactions",
+            #         "user_transaction_features:total_amount",
+            #         "user_transaction_features:avg_transaction_amount",
+            #         "user_transaction_features:unique_merchants",
+            #         "user_transaction_features:days_since_signup"
+            #     ]
+            # ).to_df()
+
+            # Example output structure
+            example_features = pd.DataFrame({
+                'user_id': entity_df['user_id'],
+                'event_timestamp': entity_df['event_timestamp'],
+                'daily_transactions': [5] * 100,
+                'total_amount': [123.45] * 100,
+                'avg_transaction_amount': [24.69] * 100,
+                'unique_merchants': [3] * 100,
+                'days_since_signup': [180] * 100
+            })
+
+            print("\n✓ Retrieved historical features for training:")
+            print(f"  Shape: {example_features.shape}")
+            print(f"  Columns: {list(example_features.columns)}")
+            print("\n  Sample:")
+            print(example_features.head())
+
+            print("\n  Use case: Train ML model with point-in-time correct features")
+            EOF
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+
+    # Template: Get online features for serving
+    - name: feast-get-online
+      container:
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q feast redis
+            python3 << 'EOF'
+            from feast import FeatureStore
+
+            print("Retrieving online features for real-time inference...")
+
+            # In production, would retrieve features from Redis:
+            # store = FeatureStore(repo_path=".")
+            # online_features = store.get_online_features(
+            #     features=[
+            #         "user_transaction_features:daily_transactions",
+            #         "user_transaction_features:total_amount",
+            #         "user_transaction_features:avg_transaction_amount"
+            #     ],
+            #     entity_rows=[
+            #         {"user_id": 123},
+            #         {"user_id": 456}
+            #     ]
+            # ).to_dict()
+
+            # Example output
+            example_online_features = {
+                'user_id': [123, 456],
+                'daily_transactions': [7, 3],
+                'total_amount': [234.56, 89.12],
+                'avg_transaction_amount': [33.51, 29.71]
+            }
+
+            print("\n✓ Retrieved online features (< 10ms latency):")
+            print(f"  Features: {example_online_features}")
+
+            print("\n  Use case: Real-time model inference")
+            print("  Latency: <10ms from Redis")
+            print("\n  Integration with KServe:")
+            print("    1. KServe model server calls Feast online store")
+            print("    2. Gets latest feature values for user_id")
+            print("    3. Makes prediction with fresh features")
+            EOF
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: "0.25"
+          limits:
+            memory: 1Gi
+            cpu: "0.5"
+
+---
+# Feast feature repository configuration (feature_store.yaml)
+# Place this in your Feast repo directory
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feast-config
+  namespace: argo
+data:
+  feature_store.yaml: |
+    project: ml_pipeline
+    registry: s3://feast-registry/registry.db
+    provider: aws
+    online_store:
+      type: redis
+      connection_string: "feast-online-store.default.svc.cluster.local:6379"
+    offline_store:
+      type: file  # Use 'bigquery' or 'snowflake' for production
+    entity_key_serialization_version: 2
+
+---
+# Feast online store deployment (Redis)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feast-online-store
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feast-redis
+  template:
+    metadata:
+      labels:
+        app: feast-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "0.5"
+            limits:
+              memory: 2Gi
+              cpu: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feast-online-store
+  namespace: default
+spec:
+  selector:
+    app: feast-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+# Example Python code for KServe integration with Feast
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kserve-feast-example
+  namespace: argo
+data:
+  model.py: |
+    # KServe custom model with Feast integration
+    import kserve
+    from feast import FeatureStore
+    import numpy as np
+
+    class FraudDetectionModel(kserve.Model):
+        def __init__(self, name: str):
+            super().__init__(name)
+            self.ready = False
+            self.feast_store = None
+
+        def load(self):
+            # Initialize Feast
+            self.feast_store = FeatureStore(repo_path="/mnt/feast-repo")
+            # Load ML model
+            # self.model = load_model("/mnt/models/fraud_detector.pkl")
+            self.ready = True
+
+        def predict(self, request):
+            # Extract user_id from request
+            user_ids = [r["user_id"] for r in request["instances"]]
+
+            # Fetch features from Feast online store
+            features = self.feast_store.get_online_features(
+                features=[
+                    "user_transaction_features:daily_transactions",
+                    "user_transaction_features:total_amount",
+                    "user_transaction_features:avg_transaction_amount"
+                ],
+                entity_rows=[{"user_id": uid} for uid in user_ids]
+            ).to_dict()
+
+            # Make prediction
+            # predictions = self.model.predict(features)
+
+            return {"predictions": [0.1, 0.9]}  # Example
+
+---
+# Quick start commands:
+#
+# 1. Deploy Feast online store (Redis):
+#    kubectl apply -f examples/feature-store-integration.yaml
+#
+# 2. Run Feast integration workflow:
+#    kubectl create -f examples/feature-store-integration.yaml -n argo
+#
+# 3. Initialize Feast feature repo:
+#    feast init feast-repo
+#    cd feast-repo
+#    feast apply
+#
+# 4. Materialize features:
+#    feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+#
+# 5. Test feature retrieval:
+#    feast features get user_transaction_features:daily_transactions --entity user_id=123

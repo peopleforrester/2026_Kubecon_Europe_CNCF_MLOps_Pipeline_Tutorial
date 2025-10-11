@@ -1,0 +1,705 @@
+# ABOUTME: Common model serving patterns for production ML deployments
+# ABOUTME: A/B testing, shadow deployment, multi-model ensemble, transformer pipelines, and batch inference
+
+---
+# Pattern 1: A/B Testing (traffic split between two model versions)
+# Use case: Compare new model v2 vs baseline v1 with 90/10 traffic split
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: ab-test-model
+  namespace: ml-serving
+spec:
+  predictor:
+    # Default predictor (90% traffic) - model v1
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50-v1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+
+  # Canary predictor (10% traffic) - model v2
+  canary:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50-v2
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+    canaryTrafficPercent: 10  # Route 10% traffic to canary
+
+---
+# Monitor A/B test results
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ab-test-analysis
+  namespace: ml-serving
+data:
+  analyze.sh: |
+    #!/bin/bash
+    # Compare metrics between default and canary
+
+    echo "=== A/B Test Analysis ==="
+
+    # Query Prometheus for metrics
+    # Default (v1) metrics
+    DEFAULT_LATENCY=$(curl -s 'http://prometheus:9090/api/v1/query' \
+      --data-urlencode 'query=histogram_quantile(0.99, rate(revision_app_request_latencies_bucket{revision_name=~"ab-test-model-predictor-default.*"}[5m]))' \
+      | jq -r '.data.result[0].value[1]')
+
+    DEFAULT_ERROR_RATE=$(curl -s 'http://prometheus:9090/api/v1/query' \
+      --data-urlencode 'query=rate(revision_app_request_count{revision_name=~"ab-test-model-predictor-default.*",response_code_class="5xx"}[5m])' \
+      | jq -r '.data.result[0].value[1]')
+
+    # Canary (v2) metrics
+    CANARY_LATENCY=$(curl -s 'http://prometheus:9090/api/v1/query' \
+      --data-urlencode 'query=histogram_quantile(0.99, rate(revision_app_request_latencies_bucket{revision_name=~"ab-test-model-predictor-canary.*"}[5m]))' \
+      | jq -r '.data.result[0].value[1]')
+
+    CANARY_ERROR_RATE=$(curl -s 'http://prometheus:9090/api/v1/query' \
+      --data-urlencode 'query=rate(revision_app_request_count{revision_name=~"ab-test-model-predictor-canary.*",response_code_class="5xx"}[5m])' \
+      | jq -r '.data.result[0].value[1]')
+
+    echo "Default (v1):"
+    echo "  - P99 Latency: ${DEFAULT_LATENCY}ms"
+    echo "  - Error Rate: ${DEFAULT_ERROR_RATE}%"
+
+    echo "Canary (v2):"
+    echo "  - P99 Latency: ${CANARY_LATENCY}ms"
+    echo "  - Error Rate: ${CANARY_ERROR_RATE}%"
+
+    # Decision criteria
+    if (( $(echo "$CANARY_ERROR_RATE > 0.01" | bc -l) )); then
+      echo "✗ Canary has high error rate, rollback recommended"
+    elif (( $(echo "$CANARY_LATENCY > $DEFAULT_LATENCY * 1.2" | bc -l) )); then
+      echo "✗ Canary latency 20% higher, rollback recommended"
+    else
+      echo "✓ Canary looks good, promote to 100%"
+    fi
+
+---
+# Pattern 2: Shadow Deployment (mirror traffic without affecting users)
+# Use case: Test new model v2 with production traffic, but don't serve results
+apiVersion: v1
+kind: Service
+metadata:
+  name: shadow-traffic-router
+  namespace: ml-serving
+spec:
+  selector:
+    app: traffic-router
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-router
+  namespace: ml-serving
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: traffic-router
+  template:
+    metadata:
+      labels:
+        app: traffic-router
+    spec:
+      containers:
+        - name: router
+          image: envoyproxy/envoy:v1.28.0
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/envoy
+      volumes:
+        - name: config
+          configMap:
+            name: envoy-shadow-config
+
+---
+# Envoy config for traffic mirroring
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-shadow-config
+  namespace: ml-serving
+data:
+  envoy.yaml: |
+    static_resources:
+      listeners:
+        - name: listener_0
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 8080
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: backend
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: "/"
+                              route:
+                                cluster: model_v1  # Production traffic
+                                request_mirror_policies:
+                                  - cluster: model_v2_shadow  # Shadow traffic
+                                    runtime_fraction:
+                                      default_value:
+                                        numerator: 100  # Mirror 100% of traffic
+                                        denominator: HUNDRED
+                    http_filters:
+                      - name: envoy.filters.http.router
+      clusters:
+        - name: model_v1
+          connect_timeout: 5s
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: model_v1
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: model-v1.ml-serving.svc.cluster.local
+                          port_value: 80
+        - name: model_v2_shadow
+          connect_timeout: 5s
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: model_v2_shadow
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: model-v2-shadow.ml-serving.svc.cluster.local
+                          port_value: 80
+
+---
+# Pattern 3: Multi-Model Ensemble (combine predictions from multiple models)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: ensemble-model
+  namespace: ml-serving
+spec:
+  predictor:
+    containers:
+      - name: ensemble-server
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q flask requests numpy
+
+            cat > server.py << 'EOF'
+            from flask import Flask, request, jsonify
+            import requests
+            import numpy as np
+
+            app = Flask(__name__)
+
+            # Model endpoints
+            MODEL_1_URL = "http://resnet50.ml-serving/v1/models/resnet50:predict"
+            MODEL_2_URL = "http://efficientnet.ml-serving/v1/models/efficientnet:predict"
+            MODEL_3_URL = "http://vit.ml-serving/v1/models/vit:predict"
+
+            @app.route('/v1/models/ensemble:predict', methods=['POST'])
+            def predict():
+                data = request.json
+                instances = data['instances']
+
+                # Get predictions from all models
+                pred1 = requests.post(MODEL_1_URL, json={'instances': instances}).json()
+                pred2 = requests.post(MODEL_2_URL, json={'instances': instances}).json()
+                pred3 = requests.post(MODEL_3_URL, json={'instances': instances}).json()
+
+                # Ensemble strategy: Weighted voting
+                weights = [0.4, 0.3, 0.3]  # ResNet50: 40%, EfficientNet: 30%, ViT: 30%
+                predictions = []
+
+                for p1, p2, p3 in zip(pred1['predictions'], pred2['predictions'], pred3['predictions']):
+                    ensemble_pred = (
+                        np.array(p1) * weights[0] +
+                        np.array(p2) * weights[1] +
+                        np.array(p3) * weights[2]
+                    )
+                    predictions.append(ensemble_pred.tolist())
+
+                return jsonify({'predictions': predictions})
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=8080)
+            EOF
+
+            python server.py
+
+        ports:
+          - containerPort: 8080
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+
+---
+# Pattern 4: Transformer Pipeline (preprocessing → model → postprocessing)
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: pipeline-model
+  namespace: ml-serving
+spec:
+  # Step 1: Transformer (preprocessing)
+  transformer:
+    containers:
+      - name: image-preprocessor
+        image: python:3.11-slim
+        command: [sh, -c]
+        args:
+          - |
+            pip install -q flask pillow numpy requests
+
+            cat > transformer.py << 'EOF'
+            from flask import Flask, request, jsonify
+            from PIL import Image
+            import numpy as np
+            import base64
+            import io
+            import requests
+
+            app = Flask(__name__)
+
+            @app.route('/v1/models/pipeline-model:predict', methods=['POST'])
+            def transform():
+                data = request.json
+
+                # Decode base64 images
+                processed_instances = []
+                for instance in data['instances']:
+                    # Assume instance is base64-encoded image
+                    img_data = base64.b64decode(instance['image'])
+                    img = Image.open(io.BytesIO(img_data))
+
+                    # Resize to 224x224
+                    img = img.resize((224, 224))
+
+                    # Convert to numpy array and normalize
+                    img_array = np.array(img) / 255.0
+
+                    processed_instances.append(img_array.tolist())
+
+                # Forward to predictor
+                predictor_url = "http://localhost:8080/v1/models/pipeline-model:predict"
+                response = requests.post(predictor_url, json={'instances': processed_instances})
+
+                return jsonify(response.json())
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=8081)
+            EOF
+
+            python transformer.py
+
+        ports:
+          - containerPort: 8081
+
+  # Step 2: Predictor (model inference)
+  predictor:
+    pytorch:
+      storageUri: s3://ml-models/pytorch/resnet50
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+          nvidia.com/gpu: "1"
+
+---
+# Pattern 5: Batch Inference (queue-based processing)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch-inference-worker
+  namespace: ml-serving
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: batch-worker
+  template:
+    metadata:
+      labels:
+        app: batch-worker
+    spec:
+      containers:
+        - name: worker
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q kafka-python boto3 torch
+
+              cat > worker.py << 'EOF'
+              from kafka import KafkaConsumer, KafkaProducer
+              import json
+              import torch
+              import boto3
+
+              # Kafka consumer
+              consumer = KafkaConsumer(
+                  'ml-inference-requests',
+                  bootstrap_servers='kafka:9092',
+                  group_id='batch-inference-workers',
+                  value_deserializer=lambda m: json.loads(m.decode('utf-8'))
+              )
+
+              # Kafka producer
+              producer = KafkaProducer(
+                  bootstrap_servers='kafka:9092',
+                  value_serializer=lambda v: json.dumps(v).encode('utf-8')
+              )
+
+              # Load model
+              s3 = boto3.client('s3')
+              s3.download_file('ml-models', 'pytorch/resnet50/model.pth', '/tmp/model.pth')
+              model = torch.load('/tmp/model.pth')
+              model.eval()
+
+              print("Worker started, waiting for messages...")
+
+              # Process messages
+              for message in consumer:
+                  data = message.value
+                  request_id = data['request_id']
+                  instances = data['instances']
+
+                  # Run inference
+                  with torch.no_grad():
+                      inputs = torch.tensor(instances)
+                      predictions = model(inputs)
+
+                  # Send result to output topic
+                  result = {
+                      'request_id': request_id,
+                      'predictions': predictions.tolist()
+                  }
+                  producer.send('ml-inference-results', value=result)
+
+                  print(f"Processed request {request_id}")
+              EOF
+
+              python worker.py
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+
+---
+# Pattern 6: Model Chaining (output of model1 → input of model2)
+apiVersion: v1
+kind: Service
+metadata:
+  name: chained-inference
+  namespace: ml-serving
+spec:
+  selector:
+    app: chain-orchestrator
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chain-orchestrator
+  namespace: ml-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: chain-orchestrator
+  template:
+    metadata:
+      labels:
+        app: chain-orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q flask requests
+
+              cat > orchestrator.py << 'EOF'
+              from flask import Flask, request, jsonify
+              import requests
+
+              app = Flask(__name__)
+
+              @app.route('/predict', methods=['POST'])
+              def predict():
+                  data = request.json
+
+                  # Step 1: Object detection model
+                  detection_response = requests.post(
+                      'http://object-detector.ml-serving/v1/models/yolo:predict',
+                      json={'instances': data['images']}
+                  )
+                  bounding_boxes = detection_response.json()['predictions']
+
+                  # Step 2: Crop detected objects
+                  cropped_objects = []
+                  for image, boxes in zip(data['images'], bounding_boxes):
+                      for box in boxes:
+                          # Crop logic (simplified)
+                          cropped = crop_image(image, box)
+                          cropped_objects.append(cropped)
+
+                  # Step 3: Classification model on cropped objects
+                  classification_response = requests.post(
+                      'http://classifier.ml-serving/v1/models/resnet:predict',
+                      json={'instances': cropped_objects}
+                  )
+                  classifications = classification_response.json()['predictions']
+
+                  # Step 4: Combine results
+                  results = []
+                  for i, boxes in enumerate(bounding_boxes):
+                      objects = []
+                      for j, box in enumerate(boxes):
+                          objects.append({
+                              'bounding_box': box,
+                              'class': classifications[j]['class'],
+                              'confidence': classifications[j]['confidence']
+                          })
+                      results.append({
+                          'image_id': i,
+                          'detected_objects': objects
+                      })
+
+                  return jsonify({'results': results})
+
+              def crop_image(image, box):
+                  # Image cropping logic
+                  return image  # Simplified
+
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              EOF
+
+              python orchestrator.py
+
+          ports:
+            - containerPort: 8080
+
+---
+# Pattern 7: Fallback/Retry (try fast model first, fallback to accurate model)
+apiVersion: v1
+kind: Service
+metadata:
+  name: fallback-inference
+  namespace: ml-serving
+spec:
+  selector:
+    app: fallback-router
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fallback-router
+  namespace: ml-serving
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fallback-router
+  template:
+    metadata:
+      labels:
+        app: fallback-router
+    spec:
+      containers:
+        - name: router
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - |
+              pip install -q flask requests
+
+              cat > router.py << 'EOF'
+              from flask import Flask, request, jsonify
+              import requests
+
+              app = Flask(__name__)
+
+              FAST_MODEL_URL = "http://mobilenet.ml-serving/v1/models/mobilenet:predict"
+              ACCURATE_MODEL_URL = "http://resnet50.ml-serving/v1/models/resnet50:predict"
+
+              CONFIDENCE_THRESHOLD = 0.8
+
+              @app.route('/v1/models/adaptive:predict', methods=['POST'])
+              def predict():
+                  data = request.json
+
+                  # Try fast model first
+                  try:
+                      fast_response = requests.post(
+                          FAST_MODEL_URL,
+                          json=data,
+                          timeout=0.1  # 100ms timeout
+                      )
+                      result = fast_response.json()
+
+                      # Check confidence
+                      max_confidence = max([p['confidence'] for p in result['predictions']])
+
+                      if max_confidence >= CONFIDENCE_THRESHOLD:
+                          # Fast model is confident, return its prediction
+                          return jsonify(result)
+                      else:
+                          # Low confidence, fallback to accurate model
+                          print(f"Low confidence ({max_confidence}), using accurate model")
+
+                  except requests.exceptions.Timeout:
+                      print("Fast model timeout, using accurate model")
+
+                  # Fallback to accurate model
+                  accurate_response = requests.post(ACCURATE_MODEL_URL, json=data)
+                  return jsonify(accurate_response.json())
+
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              EOF
+
+              python router.py
+
+          ports:
+            - containerPort: 8080
+
+---
+# Best Practices Summary:
+#
+# 1. A/B Testing:
+#    - Start with 5-10% canary traffic
+#    - Monitor for 24-48 hours
+#    - Compare: latency, error rate, accuracy
+#    - Gradually increase if successful (10% → 25% → 50% → 100%)
+#
+# 2. Shadow Deployment:
+#    - Mirror 100% of production traffic
+#    - Don't serve shadow model results to users
+#    - Compare predictions offline
+#    - Detect model drift before deployment
+#
+# 3. Ensemble:
+#    - Use 3-5 models (diminishing returns beyond 5)
+#    - Weight models by accuracy/latency tradeoff
+#    - Strategies: voting, weighted average, stacking
+#    - Latency = max(model latencies) if parallel
+#
+# 4. Transformer Pipeline:
+#    - Separate preprocessing from model
+#    - Scale preprocessor independently (usually CPU)
+#    - Cache preprocessing results if possible
+#    - Use protocol v2 for efficient data passing
+#
+# 5. Batch Inference:
+#    - Use queue-based (Kafka, SQS) for async workloads
+#    - Autoscale workers based on queue depth
+#    - Batch requests for GPU efficiency (8-32 per batch)
+#    - Set timeouts to prevent stale jobs
+#
+# 6. Model Chaining:
+#    - Orchestrate complex workflows (detection → classification)
+#    - Cache intermediate results
+#    - Parallelize independent steps
+#    - Monitor end-to-end latency
+#
+# 7. Fallback/Retry:
+#    - Try fast model first, fallback if low confidence
+#    - Set timeouts for fast model (50-100ms)
+#    - Use circuit breaker to prevent cascading failures
+#    - Monitor fallback rate (should be < 20%)
+#
+# Real-world impact:
+# - A/B testing: Prevent 95% of bad deployments
+# - Shadow deployment: Detect model drift 3 months earlier
+# - Ensemble: +2-5% accuracy improvement
+# - Batch inference: 10x throughput vs online
+# - Fallback: 50% latency reduction for high-confidence cases
+#
+# Pattern selection guide:
+# Use A/B testing when:
+#   - Testing new model version
+#   - Comparing algorithms
+#   - Gradual rollout
+#
+# Use shadow deployment when:
+#   - Risk-averse deployment
+#   - Model drift detection
+#   - Offline evaluation with real traffic
+#
+# Use ensemble when:
+#   - Need highest accuracy
+#   - Diverse model architectures
+#   - Can tolerate higher latency
+#
+# Use transformer when:
+#   - Complex preprocessing
+#   - Need to scale preprocessing independently
+#   - Reusable preprocessing logic
+#
+# Use batch inference when:
+#   - Async workloads (email classification, report generation)
+#   - High throughput > low latency
+#   - GPU utilization optimization
+#
+# Use model chaining when:
+#   - Multi-step workflows
+#   - Output of one model feeds another
+#   - Complex business logic
+#
+# Use fallback when:
+#   - Latency-critical
+#   - Can trade accuracy for speed
+#   - Most requests have high confidence

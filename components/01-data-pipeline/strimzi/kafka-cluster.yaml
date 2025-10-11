@@ -1,0 +1,253 @@
+# ABOUTME: Kafka cluster configuration for ML data pipeline with 3 brokers
+# ABOUTME: Optimized for high-throughput ML training data ingestion and feature streaming
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: ml-data-cluster
+  namespace: kafka
+  labels:
+    app: kafka
+    component: ml-data-pipeline
+spec:
+  # Kafka broker configuration
+  kafka:
+    version: 3.7.0
+    replicas: 3  # 3 brokers for HA and replication factor 3
+
+    # Listener configuration
+    listeners:
+      # Internal listener for in-cluster communication
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+
+      # TLS listener for secure in-cluster communication
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+        authentication:
+          type: tls
+
+      # External listener for outside cluster (optional, for development)
+      - name: external
+        port: 9094
+        type: nodeport
+        tls: false
+        configuration:
+          bootstrap:
+            nodePort: 32100
+
+    # Kafka broker configuration
+    config:
+      # Replication settings
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+
+      # Performance tuning for ML workloads
+      num.network.threads: 8
+      num.io.threads: 16
+      socket.send.buffer.bytes: 102400
+      socket.receive.buffer.bytes: 102400
+      socket.request.max.bytes: 104857600  # 100MB
+
+      # Log retention for ML training data
+      log.retention.hours: 168  # 7 days (adjust based on retraining frequency)
+      log.retention.bytes: 1073741824  # 1GB per partition
+      log.segment.bytes: 1073741824  # 1GB segments
+
+      # Compression (saves storage for large ML datasets)
+      compression.type: snappy
+
+      # Enable auto topic creation
+      auto.create.topics.enable: false  # Force explicit topic creation for governance
+
+      # Group coordinator settings
+      group.initial.rebalance.delay.ms: 3000
+
+    # Storage configuration
+    storage:
+      type: persistent-claim
+      size: 100Gi  # 100GB per broker (adjust based on data volume)
+      class: fast-ssd  # Use fast SSD for low-latency writes
+      deleteClaim: false  # Keep data on cluster deletion (safety)
+
+    # Resource allocation
+    resources:
+      requests:
+        memory: 4Gi
+        cpu: "2"
+      limits:
+        memory: 6Gi
+        cpu: "4"
+
+    # JVM options for Kafka brokers
+    jvmOptions:
+      -Xms: 3g
+      -Xmx: 3g  # Leave room for OS page cache (crucial for Kafka performance)
+      gcLoggingEnabled: true
+
+    # Metrics configuration for Prometheus
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+
+  # ZooKeeper configuration (for Kafka < 3.8, KRaft mode preferred for 3.8+)
+  zookeeper:
+    replicas: 3  # 3 ZooKeeper nodes for quorum
+
+    storage:
+      type: persistent-claim
+      size: 10Gi
+      class: fast-ssd
+      deleteClaim: false
+
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: "0.5"
+      limits:
+        memory: 2Gi
+        cpu: "1"
+
+    # Metrics configuration
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: zookeeper-metrics-config.yml
+
+  # Entity Operator (manages topics and users)
+  entityOperator:
+    topicOperator:
+      resources:
+        requests:
+          memory: 512Mi
+          cpu: "0.2"
+        limits:
+          memory: 1Gi
+          cpu: "0.5"
+
+    userOperator:
+      resources:
+        requests:
+          memory: 512Mi
+          cpu: "0.2"
+        limits:
+          memory: 1Gi
+          cpu: "0.5"
+
+---
+# Kafka Metrics ConfigMap for Prometheus
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics
+  namespace: kafka
+data:
+  kafka-metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+      # Kafka broker metrics
+      - pattern: kafka.server<type=(.+), name=(.+), clientId=(.+), topic=(.+), partition=(.*)><>Value
+        name: kafka_server_$1_$2
+        type: GAUGE
+        labels:
+          clientId: "$3"
+          topic: "$4"
+          partition: "$5"
+
+      # Request metrics
+      - pattern: kafka.network<type=RequestMetrics, name=RequestsPerSec, request=(.+)><>Count
+        name: kafka_network_requests_per_sec
+        type: COUNTER
+        labels:
+          request: "$1"
+
+      # Byte rate metrics
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec), topic=(.+)><>Count
+        name: kafka_server_broker_topic_metrics_$1
+        type: COUNTER
+        labels:
+          topic: "$2"
+
+      # Under-replicated partitions (critical for ML data reliability)
+      - pattern: kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value
+        name: kafka_server_replica_manager_under_replicated_partitions
+        type: GAUGE
+
+  zookeeper-metrics-config.yml: |
+    lowercaseOutputName: true
+    rules:
+      # ZooKeeper metrics
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+)><>(\\w+)"
+        name: "zookeeper_$2"
+        type: GAUGE
+      - pattern: "org.apache.ZooKeeperService<name0=ReplicatedServer_id(\\d+), name1=replica.(\\d+)><>(\\w+)"
+        name: "zookeeper_$3"
+        type: GAUGE
+        labels:
+          replicaId: "$2"
+
+---
+# ServiceMonitor for Prometheus Operator to scrape Kafka metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kafka-metrics
+  namespace: kafka
+  labels:
+    app: strimzi
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/kind: Kafka
+      strimzi.io/name: ml-data-cluster-kafka
+  endpoints:
+    - port: tcp-prometheus
+      interval: 30s
+      path: /metrics
+
+---
+# NetworkPolicy for Kafka (optional, for security)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-network-policy
+  namespace: kafka
+spec:
+  podSelector:
+    matchLabels:
+      strimzi.io/cluster: ml-data-cluster
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from same namespace (Kafka clients)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: kafka
+        - namespaceSelector:
+            matchLabels:
+              name: ml-training  # Training pods
+        - namespaceSelector:
+            matchLabels:
+              name: ml-serving   # Serving pods
+      ports:
+        - protocol: TCP
+          port: 9092  # Kafka plaintext
+        - protocol: TCP
+          port: 9093  # Kafka TLS
+  egress:
+    # Allow all egress (Kafka needs to communicate with ZooKeeper and other brokers)
+    - {}
