@@ -3,8 +3,8 @@
 name: Security Scanning
 
 on:
-  push:
-    branches: [ main, develop ]
+  # Push-triggered scanning runs via ci.yml to avoid duplicate runs.
+  # This workflow handles PRs, manual dispatch, and scheduled checks.
   pull_request:
     branches: [ main, develop ]
   workflow_dispatch:

@@ -2,7 +2,7 @@
 # ABOUTME: YAML validation script for Kubernetes manifests using kubeconform
 # ABOUTME: Validates syntax, schema compliance, and best practices for all YAML files
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'

@@ -3,11 +3,8 @@
 name: YAML Validation
 
 on:
-  push:
-    paths:
-      - '**.yaml'
-      - '**.yml'
-      - 'scripts/validate-yaml.sh'
+  # Push-triggered validation runs via ci.yml to avoid duplicate runs.
+  # This workflow handles PRs, manual dispatch, and scheduled checks.
   pull_request:
     paths:
       - '**.yaml'

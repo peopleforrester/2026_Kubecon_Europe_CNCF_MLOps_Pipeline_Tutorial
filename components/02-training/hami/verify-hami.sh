@@ -2,7 +2,7 @@
 # ABOUTME: Verification script for HAMi GPU virtualization installation
 # ABOUTME: Checks device plugin, scheduler, GPU resources, and tests GPU sharing
 
-set -e
+set -euo pipefail
 
 echo "=========================================="
 echo "HAMi GPU Virtualization Verification"

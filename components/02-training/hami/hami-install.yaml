@@ -42,6 +42,10 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+      # NOTE: hostNetwork and hostPID are required for GPU device plugins to discover
+      # and manage NVIDIA devices on the host. This is an intentional exception to the
+      # Gatekeeper policies that restrict privileged workloads for user pods. Device
+      # plugins run as DaemonSets on GPU nodes and need direct hardware access.
       hostNetwork: true
       hostPID: true
       priorityClassName: system-node-critical
@@ -63,6 +67,10 @@ spec:
                   fieldPath: spec.nodeName
             - name: HOOK_PATH
               value: "/usr/local/vgpu/hook"
+          # Privileged mode is required for GPU device plugins to access /dev/nvidia*
+          # devices and inject the vGPU hook library into containers. This is an
+          # accepted exception; Gatekeeper policies should exempt the kube-system
+          # namespace or label-match HAMi DaemonSet pods.
           securityContext:
             privileged: true
             capabilities:

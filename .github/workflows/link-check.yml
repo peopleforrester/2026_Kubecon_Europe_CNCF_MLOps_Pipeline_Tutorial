@@ -3,11 +3,8 @@
 name: Link Checking
 
 on:
-  push:
-    paths:
-      - '**.md'
-      - '**.markdown'
-      - 'scripts/check-links.sh'
+  # Push-triggered link checking runs via ci.yml to avoid duplicate runs.
+  # This workflow handles PRs, manual dispatch, and scheduled checks.
   pull_request:
     paths:
       - '**.md'

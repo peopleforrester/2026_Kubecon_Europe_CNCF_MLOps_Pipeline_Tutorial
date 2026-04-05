@@ -2,7 +2,7 @@
 # ABOUTME: Link checker script for markdown files and documentation
 # ABOUTME: Validates internal file references and external URLs for broken links
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'

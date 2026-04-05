@@ -2,7 +2,7 @@
 # ABOUTME: Validation script for Volcano scheduler installation and gang scheduling verification
 # ABOUTME: Checks operator health, CRDs, queues, and submits test gang scheduling job
 
-set -e
+set -euo pipefail
 
 echo "=========================================="
 echo "Volcano Scheduler Verification"

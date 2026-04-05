@@ -2,7 +2,7 @@
 # ABOUTME: Security scanning script for detecting hardcoded secrets and insecure configurations
 # ABOUTME: Scans YAML, shell scripts, and documentation for security issues
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
