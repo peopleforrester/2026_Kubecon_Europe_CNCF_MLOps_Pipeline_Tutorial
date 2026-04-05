@@ -29,6 +29,12 @@ on:
         description: 'Experiment ID'
         required: false
 
+permissions:
+  contents: write
+  packages: read
+  security-events: write
+  pull-requests: write
+
 env:
   REGISTRY: harbor.ml-platform.example.com
   MODEL_REGISTRY: harbor.ml-platform.example.com/ml-models
@@ -41,10 +47,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -68,7 +74,7 @@ jobs:
           pytest training/tests/ -v --cov=training --cov-report=xml --cov-report=term
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5.5.4
         with:
           file: ./coverage.xml
           flags: unittests
@@ -90,13 +96,13 @@ jobs:
       image_tag: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to Harbor
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.HARBOR_USERNAME }}
@@ -104,7 +110,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.REGISTRY }}/ml-training/trainer
           tags: |
@@ -114,7 +120,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push training image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ./training
           file: ./training/Dockerfile
@@ -127,15 +133,17 @@ jobs:
             PYTHON_VERSION=3.11
             CUDA_VERSION=12.1
 
+      # Pin trivy-action to known-safe SHA before the March 2026 supply chain compromise.
+      # See: https://github.com/aquasecurity/trivy/discussions/10425
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 (pre-compromise)
         with:
           image-ref: ${{ env.REGISTRY }}/ml-training/trainer:${{ github.sha }}
           format: 'sarif'
           output: 'trivy-results.sarif'
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@5c8a8a642e79153f5d047b10ec1cba1d1cc65699 # v3.35.1
         with:
           sarif_file: 'trivy-results.sarif'
 
@@ -147,10 +155,10 @@ jobs:
     if: github.event_name != 'pull_request'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up kubectl
-        uses: azure/setup-kubectl@v3
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
         with:
           version: 'v1.28.0'
 
@@ -262,10 +270,10 @@ jobs:
     needs: submit-training
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
@@ -321,7 +329,7 @@ jobs:
 
       - name: Comment metrics on PR
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             github.rest.issues.createComment({
@@ -347,10 +355,10 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up kubectl
-        uses: azure/setup-kubectl@v3
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
 
       - name: Configure kubeconfig
         run: |
@@ -387,12 +395,10 @@ jobs:
             ${{ env.MODEL_REGISTRY }}/${{ github.event.inputs.model_name || 'resnet50' }}:latest
 
       - name: Create GitHub release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: model-${{ github.event.inputs.model_name || 'resnet50' }}-${{ github.sha }}
-          release_name: Model ${{ github.event.inputs.model_name || 'resnet50' }} - ${{ github.sha }}
+          name: Model ${{ github.event.inputs.model_name || 'resnet50' }} - ${{ github.sha }}
           body: |
             ## Model Training Complete
 

@@ -18,13 +18,16 @@ on:
     # Run weekly on Wednesdays at 9 AM UTC
     - cron: '0 9 * * 3'
 
+permissions:
+  contents: read
+
 jobs:
   link-check:
     name: Check Links
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install dependencies
         run: |
@@ -51,7 +54,7 @@ jobs:
 
       - name: Upload link check results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: link-check-results
           path: scripts/check-links.sh
