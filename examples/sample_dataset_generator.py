@@ -5,7 +5,7 @@ import argparse
 import json
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 
 
@@ -47,7 +47,7 @@ class DatasetGenerator:
 
         # Convert to classes
         if n_classes == 2:
-            y = (y_continuous > y_continuous.median()).astype(int)
+            y = (y_continuous > np.median(y_continuous)).astype(int)
         else:
             y = pd.cut(y_continuous, bins=n_classes, labels=False)
 
@@ -129,7 +129,7 @@ class DatasetGenerator:
         """
         print(f"Generating time-series dataset: {n_samples} samples, {n_features} features")
 
-        timestamps = pd.date_range(start='2024-01-01', periods=n_samples, freq='1H')
+        timestamps = pd.date_range(start='2024-01-01', periods=n_samples, freq='1h')
 
         data = {
             'timestamp': timestamps,
@@ -191,7 +191,7 @@ class DatasetGenerator:
         for i in range(n_messages):
             message = {
                 'id': i,
-                'timestamp': (datetime.utcnow() + timedelta(seconds=i)).isoformat(),
+                'timestamp': (datetime.now(timezone.utc) + timedelta(seconds=i)).isoformat(),
                 'features': {
                     f'feature_{j}': float(np.random.randn())
                     for j in range(n_features)
