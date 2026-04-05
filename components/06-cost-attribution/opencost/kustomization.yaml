@@ -1,0 +1,7 @@
+# ABOUTME: Kustomize entrypoint for OpenCost GPU cost attribution.
+# ABOUTME: Installs OpenCost with NVIDIA DCGM integration for per-workload GPU cost tracking.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - opencost-install.yaml

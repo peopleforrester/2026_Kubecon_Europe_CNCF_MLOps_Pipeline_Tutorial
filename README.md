@@ -290,7 +290,7 @@ Distributed training with gang scheduling preventing deadlocks, GPU virtualizati
 kubectl apply -k components/02-training/volcano/
 
 # Deploy distributed PyTorch training
-kubectl apply -f components/02-training/examples/pytorch/distributed-training.yaml
+kubectl apply -f components/02-training/pytorch/pytorch-ddp-multinode.yaml
 
 # Deploy LLM with KAITO
 kubectl apply -f components/02-training/kaito/llama2-workspace.yaml
@@ -365,7 +365,7 @@ Distributed tracing, metrics collection, log aggregation, and GPU cost attributi
 **Quick Deploy:**
 ```bash
 # Install OpenCost with GPU support
-kubectl apply -k components/05-observability/opencost/
+kubectl apply -k components/06-cost-attribution/opencost/
 
 # Access cost dashboard
 kubectl port-forward -n opencost svc/opencost 9090:9090

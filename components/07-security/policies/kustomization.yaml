@@ -1,0 +1,7 @@
+# ABOUTME: Kustomize entrypoint for OPA Gatekeeper security policies.
+# ABOUTME: Enforces pod security, resource limits, and container restrictions.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - gatekeeper-policies.yaml

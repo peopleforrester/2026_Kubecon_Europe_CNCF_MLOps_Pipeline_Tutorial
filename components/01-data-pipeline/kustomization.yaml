@@ -1,0 +1,11 @@
+# ABOUTME: Kustomize entrypoint for the data pipeline stage.
+# ABOUTME: Installs Argo Workflows and supporting workflow templates.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - argo-workflows/argo-workflows-install.yaml
+  - argo-workflows/data-preprocessing-workflow.yaml
+  - argo-workflows/data-validation-workflow.yaml
+  - argo-workflows/feature-engineering-template.yaml
+  - argo-workflows/workflow-events.yaml

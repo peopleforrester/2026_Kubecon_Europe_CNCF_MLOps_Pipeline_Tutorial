@@ -1,0 +1,7 @@
+# ABOUTME: Kustomize entrypoint for RBAC namespace isolation.
+# ABOUTME: Configures role-based access control for ML team namespaces.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - rbac-namespace-isolation.yaml

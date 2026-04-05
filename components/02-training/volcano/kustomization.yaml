@@ -1,0 +1,8 @@
+# ABOUTME: Kustomize entrypoint for Volcano scheduler installation.
+# ABOUTME: Installs Volcano and configures queues for ML training workloads.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - volcano-install.yaml
+  - volcano-queues.yaml
