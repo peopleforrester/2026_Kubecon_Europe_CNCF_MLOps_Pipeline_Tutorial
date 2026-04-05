@@ -35,9 +35,18 @@ spec:
         app: volcano-scheduler
     spec:
       serviceAccountName: volcano-scheduler
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: volcano-scheduler
-          image: volcanosh/vc-scheduler:v1.9.0
+          image: volcanosh/vc-scheduler:v1.11.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           args:
             - --logtostderr
             - --scheduler-conf=/volcano.scheduler/volcano-scheduler.conf
@@ -99,9 +108,18 @@ spec:
         app: volcano-controllers
     spec:
       serviceAccountName: volcano-controllers
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: volcano-controllers
-          image: volcanosh/vc-controller-manager:v1.9.0
+          image: volcanosh/vc-controller-manager:v1.11.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           args:
             - --logtostderr
             - --enable-healthz=true
@@ -154,9 +172,18 @@ spec:
         app: volcano-admission
     spec:
       serviceAccountName: volcano-admission
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: volcano-admission
-          image: volcanosh/vc-webhook-manager:v1.9.0
+          image: volcanosh/vc-webhook-manager:v1.11.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
           args:
             - --logtostderr
             - --tls-cert-file=/admission.local.config/certificates/tls.crt
@@ -417,7 +444,7 @@ spec:
 # Quick install command (Helm recommended):
 # helm repo add volcano-sh https://volcano-sh.github.io/helm-charts
 # helm repo update
-# helm install volcano volcano-sh/volcano -n volcano-system --create-namespace --version v1.9.0
+# helm install volcano volcano-sh/volcano -n volcano-system --create-namespace --version v1.11.0
 #
 # Verify installation:
 # kubectl get pods -n volcano-system
