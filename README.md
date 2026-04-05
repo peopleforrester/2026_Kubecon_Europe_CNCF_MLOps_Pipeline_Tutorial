@@ -788,14 +788,14 @@ By the end of the tutorial:
 ### Get Help
 
 - **Slack:** [#mlops-cncf-tutorial](https://cloud-native.slack.com/archives/mlops-cncf-tutorial) on CNCF Slack
-- **GitHub Issues:** [Report bugs or request features](https://github.com/yourusername/cncf-mlops-pipeline/issues)
-- **Discussions:** [Ask questions and share experiences](https://github.com/yourusername/cncf-mlops-pipeline/discussions)
+- **GitHub Issues:** [Report bugs or request features](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/issues)
+- **Discussions:** [Ask questions and share experiences](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/discussions)
 
 ### Office Hours
 
 **Monthly Community Call:** First Thursday of each month, 9:00 AM PT
-**Zoom:** [Meeting link](https://zoom.us/j/placeholder)
-**Calendar:** [Add to calendar](https://calendar.google.com/placeholder)
+**Zoom:** Meeting link TBD
+**Calendar:** Calendar invite TBD
 
 ### CNCF Project Communities
 
@@ -813,9 +813,9 @@ We welcome contributions from the community! This repository aims to be the defi
 
 ### How to Contribute
 
-1. **Report Issues:** Found a bug or have a feature request? [Open an issue](https://github.com/yourusername/cncf-mlops-pipeline/issues/new)
+1. **Report Issues:** Found a bug or have a feature request? [Open an issue](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/issues/new)
 2. **Submit Pull Requests:** Improvements welcome! See [CONTRIBUTING.md](CONTRIBUTING.md)
-3. **Share Experiences:** What worked or didn't work in your environment? [Start a discussion](https://github.com/yourusername/cncf-mlops-pipeline/discussions)
+3. **Share Experiences:** What worked or didn't work in your environment? [Start a discussion](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/discussions)
 4. **Improve Documentation:** Documentation PRs are highly valued
 
 ### Contribution Areas
@@ -872,7 +872,7 @@ If you use this reference architecture in your work, please cite:
   author={KubeCon Europe 2026 Tutorial},
   year={2026},
   publisher={GitHub},
-  howpublished={\\url{https://github.com/yourusername/cncf-mlops-pipeline}},
+  howpublished={\\url{https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial}},
   note={Tutorial: MLOps from Scratch using CNCF Projects}
 }
 ```

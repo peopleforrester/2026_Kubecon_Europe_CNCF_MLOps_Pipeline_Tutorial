@@ -413,7 +413,7 @@ If issues persist after trying these solutions:
    #mlops-cncf-tutorial channel
 
 5. **Tutorial Community Discussions:**
-   https://github.com/yourusername/cncf-mlops-pipeline/discussions
+   https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/discussions
 
 ---
 

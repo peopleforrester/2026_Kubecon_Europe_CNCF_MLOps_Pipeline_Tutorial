@@ -34,7 +34,7 @@ git --version
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/cncf-mlops-pipeline.git
+git clone https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial.git
 cd cncf-mlops-pipeline
 
 # Verify structure
@@ -413,12 +413,12 @@ Before deploying to production, review:
 
 ### Community
 - **Slack:** [#mlops-cncf-tutorial](https://cloud-native.slack.com/archives/mlops-cncf-tutorial) on CNCF Slack
-- **GitHub Issues:** [Report bugs or request features](https://github.com/yourusername/cncf-mlops-pipeline/issues)
-- **Discussions:** [Ask questions](https://github.com/yourusername/cncf-mlops-pipeline/discussions)
+- **GitHub Issues:** [Report bugs or request features](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/issues)
+- **Discussions:** [Ask questions](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/discussions)
 
 ### Office Hours
 - **Monthly Community Call:** First Thursday, 9:00 AM PT
-- **Zoom:** [Meeting link](https://zoom.us/j/placeholder)
+- **Zoom:** Meeting link TBD
 
 ## Cleanup
 

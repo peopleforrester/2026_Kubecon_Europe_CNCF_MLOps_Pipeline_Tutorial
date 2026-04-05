@@ -20,7 +20,7 @@ This project adheres to the [CNCF Code of Conduct](CODE_OF_CONDUCT.md). By parti
 
 ### Types of Contributions
 
-- **Bug Reports:** [Open an issue](https://github.com/yourusername/cncf-mlops-pipeline/issues/new)
+- **Bug Reports:** [Open an issue](https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial/issues/new)
 - **Feature Requests:** Propose new CNCF project integrations or optimizations
 - **Documentation:** Improve clarity, fix typos, add examples
 - **Code:** New training examples, cost optimization techniques, integrations
