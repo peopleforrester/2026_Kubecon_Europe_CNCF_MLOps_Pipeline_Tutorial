@@ -35,7 +35,7 @@ git --version
 ```bash
 # Clone the repository
 git clone https://github.com/peopleforrester/2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial.git
-cd cncf-mlops-pipeline
+cd 2026_Kubecon_Europe_CNCF_MLOps_Pipeline_Tutorial
 
 # Verify structure
 ls -la
@@ -64,17 +64,11 @@ ls -la
 ## Step 3: Install Foundation Components (2-3 minutes)
 
 ```bash
-# Install NVIDIA GPU Operator (if not already installed)
-kubectl apply -k components/00-foundation/gpu-operator/
+# Validate your cluster is ready
+./scripts/setup/validate-setup.sh
 
-# Wait for GPU operator
-kubectl wait --for=condition=ready pod -l app=nvidia-device-plugin-daemonset -n gpu-operator --timeout=3m
-
-# Install Prometheus + Grafana + AlertManager
-kubectl apply -k components/05-observability/prometheus/
-
-# Wait for monitoring stack
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=prometheus -n monitoring --timeout=3m
+# Install the complete platform (includes all components)
+./scripts/setup/quick-start.sh
 ```
 
 **Verify foundation:**
@@ -428,16 +422,14 @@ To remove all components and free up cluster resources:
 # Delete all ML platform components
 ./scripts/cleanup/remove-all.sh
 
-# Or remove individually
-kubectl delete -k components/08-cicd/argocd/
-kubectl delete -k components/07-security/
-kubectl delete -k components/06-cost-attribution/
-kubectl delete -k components/05-observability/
-kubectl delete -k components/04-model-serving/
-kubectl delete -k components/03-model-registry/
-kubectl delete -k components/02-training/
-kubectl delete -k components/01-data-pipeline/
-kubectl delete -k components/00-foundation/
+# Or remove components individually (reverse order)
+kubectl delete -f components/08-cicd/automation/deployment-automation.yaml --ignore-not-found
+kubectl delete -f components/07-security/policies/gatekeeper-policies.yaml --ignore-not-found
+kubectl delete -f components/06-cost-attribution/opencost/opencost-install.yaml --ignore-not-found
+kubectl delete -f components/04-model-serving/kserve/kserve-install.yaml --ignore-not-found
+kubectl delete -f components/02-training/hami/hami-install.yaml --ignore-not-found
+kubectl delete -f components/02-training/volcano/volcano-install.yaml --ignore-not-found
+kubectl delete -f components/01-data-pipeline/argo-workflows/argo-workflows-install.yaml --ignore-not-found
 
 # Verify cleanup
 kubectl get pods --all-namespaces | grep -E 'ml-|harbor|vault|argocd|opencost'

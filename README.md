@@ -388,14 +388,14 @@ GitOps-driven model deployment, automated validation, and declarative infrastruc
 
 **Quick Deploy:**
 ```bash
-# Install ArgoCD
-kubectl apply -k components/06-automation/argocd/
+# Install deployment automation
+kubectl apply -f components/08-cicd/automation/deployment-automation.yaml
 
-# Deploy app-of-apps pattern
-kubectl apply -f components/06-automation/argocd/app-of-apps.yaml
+# Configure automated testing
+kubectl apply -f components/08-cicd/testing/automated-testing.yaml
 ```
 
-[Full Documentation →](components/06-automation/README.md)
+[Full Documentation →](components/08-cicd/README.md)
 
 ---
 
@@ -480,7 +480,7 @@ This architecture has been validated across **100,000+ student deployments** wit
 | Missing checkpoints | Lost 72-hour runs | Checkpoint every N steps + spot instances |
 | No cost visibility | $50K surprise bills | OpenCost from day one |
 
-**Full Guide:** [cost-analysis/optimization/checklist.md](cost-analysis/optimization/checklist.md)
+**Full Guide:** [cost-analysis/optimization/optimization-checklist.md](cost-analysis/optimization/optimization-checklist.md)
 
 ---
 
@@ -607,11 +607,11 @@ strategy:
 
 **Quick Deploy:**
 ```bash
-# Install Argo CD
-kubectl apply -k components/08-cicd/argocd/
+# Install deployment automation
+kubectl apply -f components/08-cicd/automation/deployment-automation.yaml
 
-# Install Argo Rollouts
-kubectl apply -k components/08-cicd/argo-rollouts/
+# Install automated testing
+kubectl apply -f components/08-cicd/testing/automated-testing.yaml
 
 # Setup GitHub Actions secrets
 gh secret set KUBECONFIG --body "$(cat ~/.kube/config | base64)"
@@ -708,28 +708,24 @@ curl -X POST $ENDPOINT/v1/models/fraud-detection:predict \
 ## Documentation
 
 ### Getting Started
-- [5-Minute Quickstart](docs/getting-started/quickstart.md)
-- [First Training Job](docs/getting-started/first-training-job.md)
-- [First Model Serving](docs/getting-started/first-model-serving.md)
-- [Monitoring Setup](docs/getting-started/monitoring-setup.md)
-- [Cost Tracking](docs/getting-started/cost-tracking.md)
+- [5-Minute Quickstart](docs/QUICKSTART.md)
+- [Detailed Quickstart Guide](docs/getting-started/quickstart.md)
 
 ### Phase Tutorials (Complete Step-by-Step Guides)
-- [Phase 1: Foundation & Infrastructure](docs/tutorials/01-foundation.md)
-- [Phase 2: Data Pipeline Setup](docs/tutorials/02-data-pipeline.md)
-- [Phase 3: Distributed Training](docs/tutorials/03-training.md)
-- [Phase 4: Model Registry & Packaging](docs/tutorials/04-model-registry.md)
-- [Phase 5: Model Serving & Inference](docs/tutorials/05-model-serving.md)
-- [Phase 6: Observability & Monitoring](docs/tutorials/05-observability.md) ⭐ **New**
-- [Phase 7: Cost Attribution & FinOps](docs/tutorials/06-cost-attribution.md) ⭐ **New**
-- [Phase 8: Security & Governance](docs/tutorials/07-security.md) ⭐ **New**
-- [Phase 9: CI/CD Automation](docs/tutorials/08-cicd.md) ⭐ **New**
+- [Phase 1: Kafka & Data Streaming](docs/tutorials/01-kafka-setup.md)
+- [Phase 2: Workflow Basics](docs/tutorials/02-workflow-basics.md)
+- [Phase 3: Data Validation](docs/tutorials/03-data-validation.md)
+- [Phase 3b: Model Registry](docs/tutorials/03-model-registry.md)
+- [Phase 4: Feature Engineering](docs/tutorials/04-feature-engineering.md)
+- [Phase 4b: Model Serving](docs/tutorials/04-model-serving.md)
+- [Phase 5: Distributed Training](docs/tutorials/05-distributed-training.md)
+- [Phase 5b: Observability](docs/tutorials/05-observability.md)
+- [Phase 6: Cost Attribution & FinOps](docs/tutorials/06-cost-attribution.md)
+- [Phase 7: Security & Governance](docs/tutorials/07-security.md)
+- [Phase 8: CI/CD Automation](docs/tutorials/08-cicd.md)
 
 ### Architecture
 - [Complete Architecture Overview](docs/architecture/overview.md)
-- [CNCF Project Integration](docs/architecture/integration.md)
-- [GPU Scheduling Deep Dive](docs/architecture/volcano-scheduling.md)
-- [Cost Attribution Flow](docs/architecture/cost-attribution.md)
 
 ### Decision Frameworks
 - [Tool Selection Flowchart](docs/decision-frameworks/tool-selection.md)
@@ -739,14 +735,10 @@ curl -X POST $ENDPOINT/v1/models/fraud-detection:predict \
 - [Cross-Foundation Integration](docs/decision-frameworks/cross-foundation.md)
 
 ### Examples & Troubleshooting
-- [Complete Fraud Detection Pipeline](examples/complete-pipeline/fraud-detection-pipeline.yaml) ⭐ **New**
-- [50+ Common Issues & Solutions](examples/troubleshooting/common-issues.md) ⭐ **New**
-- [Performance Optimization Examples](examples/performance-tuning/optimization-examples.yaml) ⭐ **New**
-- [Top 20 Common Errors](docs/troubleshooting/common-errors.md)
-- [GPU Issues](docs/troubleshooting/gpu-issues.md)
-- [Networking Issues](docs/troubleshooting/networking-issues.md)
-- [Storage Issues](docs/troubleshooting/storage-issues.md)
-- [Performance Debugging](docs/troubleshooting/performance-issues.md)
+- [Complete Fraud Detection Pipeline](examples/complete-pipeline/fraud-detection-pipeline.yaml)
+- [50+ Common Issues & Solutions](examples/troubleshooting/common-issues.md)
+- [Performance Optimization Examples](examples/performance-tuning/optimization-examples.yaml)
+- [GPU Operator Troubleshooting](infrastructure/gpu-operator/troubleshooting.md)
 
 ---
 
@@ -779,7 +771,7 @@ By the end of the tutorial:
 - ✅ Decision framework for CNCF vs ecosystem tools
 - ✅ Integration patterns tested across 100K+ deployments
 
-**Workshop Materials:** [workshop/](workshop/)
+**Workshop Materials:** See the [tutorials](docs/tutorials/) and [examples](examples/) directories
 
 ---
 

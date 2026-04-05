@@ -15,7 +15,7 @@ Before starting, ensure you have:
 
 **Validate prerequisites:**
 ```bash
-./tests/validation/validate-prerequisites.sh
+./scripts/setup/validate-setup.sh
 ```
 
 ---
@@ -37,7 +37,7 @@ kubectl wait --for=condition=ready pod -l app=nvidia-device-plugin-daemonset -n 
 
 **Verify:**
 ```bash
-./infrastructure/gpu-operator/gpu-validation.sh
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
 ```
 
 ---
@@ -192,10 +192,10 @@ For complete 6-stage MLOps pipeline:
 
 ```bash
 # Install all components
-./scripts/setup/install-all.sh
+./scripts/setup/quick-start.sh
 
 # Deploy end-to-end example
-kubectl apply -k examples/end-to-end/complete-pipeline/
+kubectl apply -f examples/complete-pipeline/fraud-detection-pipeline.yaml
 ```
 
 See: [Architecture Overview](../architecture/overview.md)
