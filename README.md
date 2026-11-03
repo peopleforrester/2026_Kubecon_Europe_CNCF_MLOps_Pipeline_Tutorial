@@ -3,6 +3,7 @@
 [![KubeCon Europe 2026](https://img.shields.io/badge/KubeCon-Europe%202026-blue)](https://events.linuxfoundation.org/kubecon-cloudnativecon-europe/)
 [![CNCF Projects](https://img.shields.io/badge/CNCF-Graduated%20%7C%20Incubating-success)](https://www.cncf.io/projects/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Packaged with KitOps](https://img.shields.io/badge/Packaged%20with-KitOps-FFAF52?labelColor=363636)](https://kitops.org)
 
 **Build a complete end-to-end MLOps pipeline using CNCF graduated and incubating projects**
 
